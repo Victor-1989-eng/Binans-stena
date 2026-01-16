@@ -5,69 +5,69 @@ from binance.client import Client
 
 app = Flask(__name__)
 
-# --- ТВОИ НАСТРОЙКИ ---
+# --- НАСТРОЙКИ ---
 TELEGRAM_TOKEN = "7988115767:AAFhpUf-DZDRpmI6ixFbw_-OB9AsPXdpOoQ"
 TELEGRAM_CHAT_ID = "7215386084"
 SYMBOL = 'BNBUSDT'
-WALL_SIZE = 850  # Размер "плиты" для входа
+WALL_SIZE = 950 # Еще строже отбор китов
 
 def send_telegram(message):
     url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
     requests.post(url, json={"chat_id": TELEGRAM_CHAT_ID, "text": message, "parse_mode": "Markdown"})
 
+def get_btc_status(client):
+    # Проверяем, куда идет "папа" рынка (BTC) за последние 5 минут
+    klines = client.get_klines(symbol='BTCUSDT', interval=Client.KLINE_INTERVAL_1MINUTE, limit=5)
+    start_price = float(klines[0][1])
+    end_price = float(klines[-1][4])
+    return "UP" if end_price > start_price else "DOWN"
+
 def analyze_order_book():
     client = Client()
     try:
-        # Берем глубокий стакан (100 уровней)
+        btc_trend = get_btc_status(client)
         depth = client.get_order_book(symbol=SYMBOL, limit=100)
-        bids = depth['bids']
-        asks = depth['asks']
-        current_price = float(bids[0][0])
         
-        # Находим самую мощную плиту
-        best_bid = max(bids, key=lambda x: float(x[1]))
-        best_ask = max(asks, key=lambda x: float(x[1]))
+        max_bid = max(depth['bids'], key=lambda x: float(x[1]))
+        max_ask = max(depth['asks'], key=lambda x: float(x[1]))
         
-        bid_p, bid_q = float(best_bid[0]), float(best_bid[1])
-        ask_p, ask_q = float(best_ask[0]), float(best_ask[1])
-
+        bid_p, bid_q = float(max_bid[0]), float(max_bid[1])
+        ask_p, ask_q = float(max_ask[0]), float(max_ask[1])
+        
         msg = ""
 
-        # ЛОГИКА ДЛЯ ЛОНГА
+        # УСЛОВИЕ ДЛЯ ИДЕАЛЬНОГО ЛОНГА
+        # (Стена BNB + Биткоин не падает)
         if bid_q >= WALL_SIZE:
-            entry = bid_p + 0.15 # Входим чуть выше кита
-            stop = bid_p - 1.2    # Стоп за кита
-            take = entry + 4.5    # Цель (в 3 раза больше риска)
-            
-            msg = (f"🚀 **ВХОДИМ В ЛОНГ**\n\n"
-                   f"💰 Вход: `{entry}`\n"
-                   f"🛡 Стоп: `{stop}`\n"
-                   f"🎯 Тейк: `{take}`\n\n"
-                   f"ℹ️ Опора: стена {bid_q:.0f} BNB")
+            if btc_trend == "UP":
+                msg = (f"🌟 **ИДЕАЛЬНЫЙ ЛОНГ (Confirmed)**\n"
+                       f"✅ Стена: {bid_q:.0f} BNB\n"
+                       f"🌍 Поводырь (BTC): Растет 📈\n\n"
+                       f"💰 Вход: `{bid_p + 0.2}`\n🛡 Стоп: `{bid_p - 1.2}`\n🎯 Тейк: `{bid_p + 4.5}`")
+            else:
+                msg = f"⚠️ Вижу стену на покупку ({bid_q:.0f} BNB), но **BTC падает**. Вход опасен!"
 
-        # ЛОГИКА ДЛЯ ШОРТА
+        # УСЛОВИЕ ДЛЯ ИДЕАЛЬНОГО ШОРТА
         elif ask_q >= WALL_SIZE:
-            entry = ask_p - 0.15 # Входим чуть ниже кита
-            stop = ask_p + 1.2    # Стоп за кита
-            take = entry - 4.5    # Цель
-            
-            msg = (f"📉 **ВХОДИМ В ШОРТ**\n\n"
-                   f"💰 Вход: `{entry}`\n"
-                   f"🛡 Стоп: `{stop}`\n"
-                   f"🎯 Тейк: `{take}`\n\n"
-                   f"ℹ️ Сопротивление: стена {ask_q:.0f} BNB")
+            if btc_trend == "DOWN":
+                msg = (f"💀 **ИДЕАЛЬНЫЙ ШОРТ (Confirmed)**\n"
+                       f"✅ Стена: {ask_q:.0f} BNB\n"
+                       f"🌍 Поводырь (BTC): Падает 📉\n\n"
+                       f"💰 Вход: `{ask_p - 0.2}`\n🛡 Стоп: `{ask_p + 1.2}`\n🎯 Тейк: `{ask_p - 4.5}`")
+            else:
+                msg = f"⚠️ Вижу стену на продажу ({ask_q:.0f} BNB), но **BTC растет**. Не шорти!"
 
         if msg:
             send_telegram(msg)
-            return "Trade Signal Sent"
-        return "No Big Walls"
+            return "Signal processed"
+        return "Market Scan: Neutral"
     except Exception as e:
         return f"Error: {e}"
 
 @app.route('/')
 def home():
     res = analyze_order_book()
-    return f"Bot status: {res}"
+    return f"Status: {res}"
 
 if __name__ == "__main__":
     app.run(host='0.0.0.0', port=int(os.environ.get("PORT", 5000)))
