@@ -1,73 +1,115 @@
 import os
-from flask import Flask
 import requests
+from flask import Flask
 from binance.client import Client
+from binance.enums import *
 
 app = Flask(__name__)
 
-# --- НАСТРОЙКИ ---
-TELEGRAM_TOKEN = "7988115767:AAFhpUf-DZDRpmI6ixFbw_-OB9AsPXdpOoQ"
-TELEGRAM_CHAT_ID = "7215386084"
+# --- НАСТРОЙКИ (Берутся из Environment Variables на Render) ---
+API_KEY = os.environ.get("6LEfqGoQ91IBv1hWDhd6LfSWRYaSEDcKOed4DtVQozP3Bd8fjMARfFQdTd70RiV7")
+API_SECRET = os.environ.get("8oIxWg69qEGXTjiSZEmCCOEWNaNC8LCIaysT2I1LugVCRaUyiGaScSVOQDtH2tdz")
+TELEGRAM_TOKEN = os.environ.get("7988115767:AAFhpUf-DZDRpmI6ixFbw_-OB9AsPXdpOoQ")
+CHAT_ID = os.environ.get("7215386084")
+
 SYMBOL = 'BNBUSDT'
-WALL_SIZE = 950 # Еще строже отбор китов
+LEVERAGE = 75
+QTY_BNB = 0.24      # Объем позиции (~3$ с плечом 75)
+WALL_SIZE = 700     # Минимальный объем стены кита
+RANGE_MAX = 0.012   # Максимальный канал (1.2%)
+STATS_FILE = "stats.txt"
 
-def send_telegram(message):
+client = Client(API_KEY, API_SECRET)
+
+def send_tg(text):
     url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
-    requests.post(url, json={"chat_id": TELEGRAM_CHAT_ID, "text": message, "parse_mode": "Markdown"})
-
-def get_btc_status(client):
-    # Проверяем, куда идет "папа" рынка (BTC) за последние 5 минут
-    klines = client.get_klines(symbol='BTCUSDT', interval=Client.KLINE_INTERVAL_1MINUTE, limit=5)
-    start_price = float(klines[0][1])
-    end_price = float(klines[-1][4])
-    return "UP" if end_price > start_price else "DOWN"
-
-def analyze_order_book():
-    client = Client()
     try:
-        btc_trend = get_btc_status(client)
-        depth = client.get_order_book(symbol=SYMBOL, limit=100)
-        
-        max_bid = max(depth['bids'], key=lambda x: float(x[1]))
-        max_ask = max(depth['asks'], key=lambda x: float(x[1]))
-        
-        bid_p, bid_q = float(max_bid[0]), float(max_bid[1])
-        ask_p, ask_q = float(max_ask[0]), float(max_ask[1])
-        
-        msg = ""
+        requests.post(url, json={"chat_id": CHAT_ID, "text": text, "parse_mode": "Markdown"})
+    except: pass
 
-        # УСЛОВИЕ ДЛЯ ИДЕАЛЬНОГО ЛОНГА
-        # (Стена BNB + Биткоин не падает)
-        if bid_q >= WALL_SIZE:
-            if btc_trend == "UP":
-                msg = (f"🌟 **ИДЕАЛЬНЫЙ ЛОНГ (Confirmed)**\n"
-                       f"✅ Стена: {bid_q:.0f} BNB\n"
-                       f"🌍 Поводырь (BTC): Растет 📈\n\n"
-                       f"💰 Вход: `{bid_p + 0.2}`\n🛡 Стоп: `{bid_p - 1.2}`\n🎯 Тейк: `{bid_p + 4.5}`")
-            else:
-                msg = f"⚠️ Вижу стену на покупку ({bid_q:.0f} BNB), но **BTC падает**. Вход опасен!"
+def update_stats(profit):
+    if not os.path.exists(STATS_FILE):
+        with open(STATS_FILE, "w") as f: f.write("0,0.0")
+    
+    with open(STATS_FILE, "r") as f:
+        data = f.read().split(",")
+        count = int(data[0]) + 1
+        total_profit = float(data[1]) + profit
+    
+    with open(STATS_FILE, "w") as f:
+        f.write(f"{count},{total_profit}")
+    
+    if count % 10 == 0:
+        status = "🟢 ПРОФИТ" if total_profit > 0 else "🔴 УБЫТОК"
+        send_tg(f"📊 *ИТОГ СЕРИИ: 10 СДЕЛОК*\n\nРезультат: `{total_profit:.2f} USDT`\nСтатус: {status}")
 
-        # УСЛОВИЕ ДЛЯ ИДЕАЛЬНОГО ШОРТА
-        elif ask_q >= WALL_SIZE:
-            if btc_trend == "DOWN":
-                msg = (f"💀 **ИДЕАЛЬНЫЙ ШОРТ (Confirmed)**\n"
-                       f"✅ Стена: {ask_q:.0f} BNB\n"
-                       f"🌍 Поводырь (BTC): Падает 📉\n\n"
-                       f"💰 Вход: `{ask_p - 0.2}`\n🛡 Стоп: `{ask_p + 1.2}`\n🎯 Тейк: `{ask_p - 4.5}`")
-            else:
-                msg = f"⚠️ Вижу стену на продажу ({ask_q:.0f} BNB), но **BTC растет**. Не шорти!"
+def check_position_status():
+    pos = client.futures_position_information(symbol=SYMBOL)
+    for p in pos:
+        if float(p['positionAmt']) == 0:
+            trades = client.futures_account_trades(symbol=SYMBOL, limit=1)
+            if trades:
+                pnl = float(trades[0]['realizedPnl'])
+                if pnl != 0:
+                    send_tg(f"🏁 *СДЕЛКА ЗАКРЫТА*\nРезультат: `{pnl:.2f} USDT`")
+                    update_stats(pnl)
 
-        if msg:
-            send_telegram(msg)
-            return "Signal processed"
-        return "Market Scan: Neutral"
+def find_whale_walls(data):
+    for p, q in data:
+        p_val = float(p)
+        vol = sum([float(raw_q) for raw_p, raw_q in data if abs(float(raw_p) - p_val) <= 0.3])
+        if vol >= WALL_SIZE: return p_val, vol
+    return None, 0
+
+def open_trade(side, price):
+    try:
+        client.futures_change_leverage(symbol=SYMBOL, leverage=LEVERAGE)
+        client.futures_change_margin_type(symbol=SYMBOL, marginType='ISOLATED')
+        
+        order_side = SIDE_BUY if side == "LONG" else SIDE_SELL
+        client.futures_create_order(
+            symbol=SYMBOL, side=order_side, type=ORDER_TYPE_LIMIT,
+            timeInForce=TIME_IN_FORCE_GTC, quantity=QTY_BNB, price=str(round(price, 2))
+        )
+        
+        # Стоп 0.7%, Тейк 1.1%
+        stop_p = round(price * 0.993 if side == "LONG" else price * 1.007, 2)
+        take_p = round(price * 1.011 if side == "LONG" else price * 0.989, 2)
+        
+        client.futures_create_order(symbol=SYMBOL, side=SIDE_SELL if side == "LONG" else SIDE_BUY, 
+                                     type=ORDER_TYPE_STOP_MARKET, stopPrice=str(stop_p), closePosition=True)
+        client.futures_create_order(symbol=SYMBOL, side=SIDE_SELL if side == "LONG" else SIDE_BUY, 
+                                     type=ORDER_TYPE_LIMIT, timeInForce=TIME_IN_FORCE_GTC, 
+                                     price=str(take_p), quantity=QTY_BNB, reduceOnly=True)
+        
+        send_tg(f"🚀 *ВХОД {side}*\n💰 Цена: `{price}`\n🛡 Stop: `{stop_p}`\n🎯 Take: `{take_p}`")
     except Exception as e:
-        return f"Error: {e}"
+        send_tg(f"❌ Ошибка: {e}")
 
 @app.route('/')
-def home():
-    res = analyze_order_book()
-    return f"Status: {res}"
+def run_bot():
+    check_position_status()
+    pos = client.futures_position_information(symbol=SYMBOL)
+    if any(float(p['positionAmt']) != 0 for p in pos):
+        return "Position is active..."
+
+    depth = client.futures_order_book(symbol=SYMBOL, limit=100)
+    bid_p, bid_v = find_whale_walls(depth['bids'])
+    ask_p, ask_v = find_whale_walls(depth['asks'])
+
+    if bid_p and ask_p:
+        gap = (ask_p - bid_p) / bid_p
+        curr_p = float(depth['bids'][0][0])
+
+        if gap <= RANGE_MAX:
+            if curr_p <= bid_p + (ask_p - bid_p) * 0.2:
+                open_trade("LONG", bid_p + 0.15)
+                return "Opening Long"
+            elif curr_p >= ask_p - (ask_p - bid_p) * 0.2:
+                open_trade("SHORT", ask_p - 0.15)
+                return "Opening Short"
+
+    return "Searching for whale walls..."
 
 if __name__ == "__main__":
-    app.run(host='0.0.0.0', port=int(os.environ.get("PORT", 5000)))
+    app.run(host='0.0.0.0', port=5000)
