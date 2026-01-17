@@ -1,4 +1,3 @@
+python-binance
 flask
 requests
-python-binance
-gunicorn
