@@ -11,14 +11,17 @@ app = Flask(__name__)
 SYMBOL = 'BNBUSDT'
 LEVERAGE = 75
 QTY_BNB = 0.24
-WALL_SIZE = 1000     
+WALL_SIZE = 900     # Твоя настройка "Миллионер"
 RANGE_MAX = 0.015
 AGGREGATION = 0.5
-STATS_FILE = "stats.txt"
+STATS_FILE = "stats_v2.txt"
 
 # БЫСТРЫЙ ПЛАН Б
-BE_LEVEL = 0.0025   # Безубыток при +0.25% (очень быстро)
+BE_LEVEL = 0.0025   
 MAX_TIME = 3600     
+
+# Переменная для исключения дублей (в памяти процесса)
+last_processed_trade_id = None 
 # ------------------
 
 def get_binance_client():
@@ -34,18 +37,27 @@ def send_tg(text):
         try: requests.post(url, json={"chat_id": chat_id, "text": text, "parse_mode": "Markdown"})
         except: pass
 
-def update_stats(profit):
+def update_stats(profit, trade_id):
     if not os.path.exists(STATS_FILE):
-        with open(STATS_FILE, "w") as f: f.write("0,0.0")
+        with open(STATS_FILE, "w") as f: f.write(f"0,0.0,{trade_id}")
+    
     with open(STATS_FILE, "r") as f:
-        content = f.read().strip()
-        data = content.split(",") if content else ["0", "0.0"]
-        count, total = int(data[0]) + 1, float(data[1]) + profit
-    with open(STATS_FILE, "w") as f:
-        f.write(f"{count},{total}")
-    if count % 10 == 0:
-        res = "🟢 ПРОФИТ" if total > 0 else "🔴 УБЫТОК"
-        send_tg(f"📊 *ИТОГ 10 БЫСТРЫХ СДЕЛОК*: `{total:.2f} USDT` ({res})")
+        content = f.read().strip().split(",")
+        # Формат: кол-во, профит, id_последней_сделки
+        count = int(content[0])
+        total_profit = float(content[1])
+        last_id = content[2] if len(content) > 2 else ""
+
+    # Если мы этот ID еще не записывали в файл
+    if str(trade_id) != last_id:
+        count += 1
+        total_profit += profit
+        with open(STATS_FILE, "w") as f:
+            f.write(f"{count},{total_profit},{trade_id}")
+        
+        if count % 10 == 0:
+            res = "🟢 ПРОФИТ" if total_profit > 0 else "🔴 УБЫТОК"
+            send_tg(f"📊 *ИТОГ 10 СДЕЛОК*: `{total_profit:.2f} USDT` ({res})")
 
 def find_whale_walls(data):
     for p, q in data:
@@ -62,25 +74,21 @@ def open_trade(client, side, price):
 
         order_side, close_side = ('BUY', 'SELL') if side == "LONG" else ('SELL', 'BUY')
         
-        # 1. Лимитный вход
         client.futures_create_order(symbol=SYMBOL, side=order_side, type='LIMIT',
             timeInForce='GTC', quantity=QTY_BNB, price=str(round(price, 2)))
         
-        # НОВЫЕ КОРОТКИЕ ЦЕЛИ: SL 0.4%, TP 0.55%
         stop_p = round(price * 0.996 if side == "LONG" else price * 1.004, 2)
         take_p = round(price * 1.0055 if side == "LONG" else price * 0.9945, 2)
         
-        # 2. Стоп-Лосс
         client.futures_create_order(symbol=SYMBOL, side=close_side, type='STOP_MARKET',
             stopPrice=str(stop_p), closePosition=True)
         
-        # 3. Тейк-Профит
         client.futures_create_order(symbol=SYMBOL, side=close_side, type='LIMIT',
             timeInForce='GTC', price=str(take_p), quantity=QTY_BNB, reduceOnly=True)
         
-        send_tg(f"⚡️ *БЫСТРЫЙ ВХОД {side}* по `{price}`\n🛡 SL: `{stop_p}` | 🎯 TP: `{take_p}`")
+        send_tg(f"⚡️ *ВХОД {side}* по `{price}`\n🛡 SL: `{stop_p}` | 🎯 TP: `{take_p}`")
     except Exception as e:
-        send_tg(f"❌ Ошибка: {e}")
+        send_tg(f"❌ Ошибка открытия: {e}")
 
 @app.route('/')
 def run_bot():
@@ -102,10 +110,10 @@ def run_bot():
                 side = 'SELL' if amt > 0 else 'BUY'
                 client.futures_create_order(symbol=SYMBOL, side=side, type='MARKET', quantity=abs(amt), reduceOnly=True)
                 client.futures_cancel_all_open_orders(symbol=SYMBOL)
-                send_tg("⏰ Выход по времени.")
+                send_tg("⏰ Выход по времени (60 мин)")
                 return "Closed by time"
 
-            # 2. БЫСТРЫЙ БЕЗУБЫТОК
+            # 2. БЕЗУБЫТОК
             pnl_pct = (curr_p - entry_p) / entry_p if amt > 0 else (entry_p - curr_p) / entry_p
             if pnl_pct >= BE_LEVEL:
                 orders = client.futures_get_open_orders(symbol=SYMBOL)
@@ -115,17 +123,20 @@ def run_bot():
                         side = 'SELL' if amt > 0 else 'BUY'
                         client.futures_create_order(symbol=SYMBOL, side=side, type='STOP_MARKET',
                             stopPrice=str(entry_p), closePosition=True)
-                        send_tg("🛡 Безубыток включен (+0.25%)")
+                        send_tg("🛡 Безубыток активен (+0.25%)")
             
-            return f"PNL: {pnl_pct*100:.2f}%"
+            return f"В сделке. PNL: {pnl_pct*100:.2f}%"
 
-        # Если позиции нет — ищем вход
+        # ЕСЛИ ПОЗИЦИИ НЕТ
         open_orders = client.futures_get_open_orders(symbol=SYMBOL)
         if not open_orders:
+            # Проверка последней сделки для статистики
             trades = client.futures_account_trades(symbol=SYMBOL, limit=1)
             if trades:
-                pnl = float(trades[0]['realizedPnl'])
-                if pnl != 0: update_stats(pnl)
+                last_t = trades[0]
+                realized_pnl = float(last_t['realizedPnl'])
+                if realized_pnl != 0:
+                    update_stats(realized_pnl, last_t['id'])
             
             depth = client.futures_order_book(symbol=SYMBOL, limit=100)
             bid_p, _ = find_whale_walls(depth['bids'])
@@ -139,7 +150,7 @@ def run_bot():
                     elif curr_p >= ask_p - (ask_p - bid_p) * 0.2:
                         open_trade(client, "SHORT", ask_p - 0.15)
 
-        return "Охота на китов..."
+        return "Сканирую стакан на 1000 BNB..."
     except Exception as e:
         return f"Ошибка: {e}", 400
 
