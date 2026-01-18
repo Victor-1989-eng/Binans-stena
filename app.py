@@ -7,7 +7,7 @@ from binance.enums import *
 
 app = Flask(__name__)
 
-# --- НАСТРОЙКИ ---
+# --- НАСТРОЙКИ СКОРОСТНОГО СКАТЫВАНИЯ ---
 SYMBOL = 'BNBUSDT'
 LEVERAGE = 75
 QTY_BNB = 0.24
@@ -16,9 +16,9 @@ RANGE_MAX = 0.015
 AGGREGATION = 0.5
 STATS_FILE = "stats.txt"
 
-# ПЛАН Б: Настройки защиты
-BE_LEVEL = 0.005    # Безубыток при +0.5% профита
-MAX_TIME = 3600     # Закрыть сделку через 60 минут (3600 сек)
+# БЫСТРЫЙ ПЛАН Б
+BE_LEVEL = 0.0025   # Безубыток при +0.25% (очень быстро)
+MAX_TIME = 3600     
 # ------------------
 
 def get_binance_client():
@@ -45,7 +45,7 @@ def update_stats(profit):
         f.write(f"{count},{total}")
     if count % 10 == 0:
         res = "🟢 ПРОФИТ" if total > 0 else "🔴 УБЫТОК"
-        send_tg(f"📊 *ИТОГ 10 СДЕЛОК*: `{total:.2f} USDT` ({res})")
+        send_tg(f"📊 *ИТОГ 10 БЫСТРЫХ СДЕЛОК*: `{total:.2f} USDT` ({res})")
 
 def find_whale_walls(data):
     for p, q in data:
@@ -62,21 +62,25 @@ def open_trade(client, side, price):
 
         order_side, close_side = ('BUY', 'SELL') if side == "LONG" else ('SELL', 'BUY')
         
+        # 1. Лимитный вход
         client.futures_create_order(symbol=SYMBOL, side=order_side, type='LIMIT',
             timeInForce='GTC', quantity=QTY_BNB, price=str(round(price, 2)))
         
-        stop_p = round(price * 0.993 if side == "LONG" else price * 1.007, 2)
-        take_p = round(price * 1.011 if side == "LONG" else price * 0.989, 2)
+        # НОВЫЕ КОРОТКИЕ ЦЕЛИ: SL 0.4%, TP 0.55%
+        stop_p = round(price * 0.996 if side == "LONG" else price * 1.004, 2)
+        take_p = round(price * 1.0055 if side == "LONG" else price * 0.9945, 2)
         
+        # 2. Стоп-Лосс
         client.futures_create_order(symbol=SYMBOL, side=close_side, type='STOP_MARKET',
             stopPrice=str(stop_p), closePosition=True)
         
+        # 3. Тейк-Профит
         client.futures_create_order(symbol=SYMBOL, side=close_side, type='LIMIT',
             timeInForce='GTC', price=str(take_p), quantity=QTY_BNB, reduceOnly=True)
         
-        send_tg(f"🚀 *ВХОД {side}* по `{price}`\n🛡 SL: `{stop_p}` | 🎯 TP: `{take_p}`")
+        send_tg(f"⚡️ *БЫСТРЫЙ ВХОД {side}* по `{price}`\n🛡 SL: `{stop_p}` | 🎯 TP: `{take_p}`")
     except Exception as e:
-        send_tg(f"❌ Ошибка открытия: {e}")
+        send_tg(f"❌ Ошибка: {e}")
 
 @app.route('/')
 def run_bot():
@@ -93,15 +97,15 @@ def run_bot():
             trade_time = int(p['updateTime']) / 1000
             curr_p = float(client.futures_symbol_ticker(symbol=SYMBOL)['price'])
             
-            # 1. ТАЙМ-АУТ: Проверка времени (60 мин)
+            # 1. ТАЙМ-АУТ
             if (time.time() - trade_time) > MAX_TIME:
                 side = 'SELL' if amt > 0 else 'BUY'
                 client.futures_create_order(symbol=SYMBOL, side=side, type='MARKET', quantity=abs(amt), reduceOnly=True)
                 client.futures_cancel_all_open_orders(symbol=SYMBOL)
-                send_tg("⏰ *План Б:* Выход по времени (сделка висит > 60 мин)")
-                return "Закрыто по времени"
+                send_tg("⏰ Выход по времени.")
+                return "Closed by time"
 
-            # 2. БЕЗУБЫТОК: Перенос стопа
+            # 2. БЫСТРЫЙ БЕЗУБЫТОК
             pnl_pct = (curr_p - entry_p) / entry_p if amt > 0 else (entry_p - curr_p) / entry_p
             if pnl_pct >= BE_LEVEL:
                 orders = client.futures_get_open_orders(symbol=SYMBOL)
@@ -111,9 +115,9 @@ def run_bot():
                         side = 'SELL' if amt > 0 else 'BUY'
                         client.futures_create_order(symbol=SYMBOL, side=side, type='STOP_MARKET',
                             stopPrice=str(entry_p), closePosition=True)
-                        send_tg("🛡 *План Б:* Стоп перенесен в БЕЗУБЫТОК (+0.5% достигнуто)")
+                        send_tg("🛡 Безубыток включен (+0.25%)")
             
-            return f"В сделке. PNL: {pnl_pct*100:.2f}%"
+            return f"PNL: {pnl_pct*100:.2f}%"
 
         # Если позиции нет — ищем вход
         open_orders = client.futures_get_open_orders(symbol=SYMBOL)
@@ -135,7 +139,7 @@ def run_bot():
                     elif curr_p >= ask_p - (ask_p - bid_p) * 0.2:
                         open_trade(client, "SHORT", ask_p - 0.15)
 
-        return "Поиск китов..."
+        return "Охота на китов..."
     except Exception as e:
         return f"Ошибка: {e}", 400
 
