@@ -10,15 +10,15 @@ app = Flask(__name__)
 # --- НАСТРОЙКИ СКОРОСТНОГО СКАТЫВАНИЯ ---
 SYMBOL = 'BNBUSDT'
 LEVERAGE = 75
-QTY_BNB = 0.25
-WALL_SIZE = 900     # Твоя настройка "Миллионер"
+QTY_BNB = 0.25        # ИЗМЕНЕНО: Объем 0.25 (чтобы 2$ движения давали 0.50$)
+WALL_SIZE = 700      # Твоя настройка "Миллионер"
 RANGE_MAX = 0.015
 AGGREGATION = 0.5
 STATS_FILE = "stats_v2.txt"
 
 # БЫСТРЫЙ ПЛАН Б
-BE_LEVEL = 0.0015   
-MAX_TIME = 3600     
+BE_LEVEL = 0.0015     # ИЗМЕНЕНО: Безубыток на 0.15% (активируется раньше, т.к. цель короткая)
+MAX_TIME = 3600      
 
 # Переменная для исключения дублей (в памяти процесса)
 last_processed_trade_id = None 
@@ -74,11 +74,20 @@ def open_trade(client, side, price):
 
         order_side, close_side = ('BUY', 'SELL') if side == "LONG" else ('SELL', 'BUY')
         
+        # --- ИНТЕГРАЦИЯ ЛОГИКИ 50 ЦЕНТОВ ---
+        # 0.50$ прибыли / 0.25 BNB объема = Нужен ход цены 2.0 USDT
+        profit_step = 2.0 
+        
+        if side == "LONG":
+            take_p = round(price + profit_step, 2)
+            stop_p = round(price - 1.5, 2) # Стоп фиксированный 1.5$ (баланс риска)
+        else:
+            take_p = round(price - profit_step, 2)
+            stop_p = round(price + 1.5, 2)
+        # -----------------------------------
+        
         client.futures_create_order(symbol=SYMBOL, side=order_side, type='LIMIT',
             timeInForce='GTC', quantity=QTY_BNB, price=str(round(price, 2)))
-        
-        stop_p = round(price * 0.996 if side == "LONG" else price * 1.004, 2)
-        take_p = round(price * 1.0055 if side == "LONG" else price * 0.9945, 2)
         
         client.futures_create_order(symbol=SYMBOL, side=close_side, type='STOP_MARKET',
             stopPrice=str(stop_p), closePosition=True)
@@ -86,7 +95,7 @@ def open_trade(client, side, price):
         client.futures_create_order(symbol=SYMBOL, side=close_side, type='LIMIT',
             timeInForce='GTC', price=str(take_p), quantity=QTY_BNB, reduceOnly=True)
         
-        send_tg(f"⚡️ *ВХОД {side}* по `{price}`\n🛡 SL: `{stop_p}` | 🎯 TP: `{take_p}`")
+        send_tg(f"⚡️ *ВХОД {side}* (Цель 0.50$)\nВход: `{price}` | Тейк: `{take_p}`")
     except Exception as e:
         send_tg(f"❌ Ошибка открытия: {e}")
 
@@ -123,7 +132,7 @@ def run_bot():
                         side = 'SELL' if amt > 0 else 'BUY'
                         client.futures_create_order(symbol=SYMBOL, side=side, type='STOP_MARKET',
                             stopPrice=str(entry_p), closePosition=True)
-                        send_tg("🛡 Безубыток активен (+0.25%)")
+                        send_tg("🛡 Безубыток активен (+0.15%)")
             
             return f"В сделке. PNL: {pnl_pct*100:.2f}%"
 
