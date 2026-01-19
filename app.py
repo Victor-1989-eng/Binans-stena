@@ -9,8 +9,8 @@ app = Flask(__name__)
 
 # --- НАСТРОЙКИ СКОРОСТНОГО СКАТЫВАНИЯ ---
 SYMBOL = 'BNBUSDT'
-LEVERAGE = 50
-QTY_BNB = 0.35
+LEVERAGE = 75
+QTY_BNB = 0.25
 WALL_SIZE = 900     # Твоя настройка "Миллионер"
 RANGE_MAX = 0.015
 AGGREGATION = 0.5
