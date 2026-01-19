@@ -10,19 +10,15 @@ app = Flask(__name__)
 # --- НАСТРОЙКИ СКОРОСТНОГО СКАТЫВАНИЯ ---
 SYMBOL = 'BNBUSDT'
 LEVERAGE = 75
-QTY_BNB = 0.25        # ИЗМЕНЕНО: Объем 0.25 (чтобы 2$ движения давали 0.50$)
-WALL_SIZE = 900      # Твоя настройка "Миллионер"
+QTY_BNB = 0.25        # Объем для цели 0.50$
+WALL_SIZE = 900      # Настройка "Миллионер"
 RANGE_MAX = 0.015
 AGGREGATION = 0.5
 STATS_FILE = "stats_v2.txt"
 
 # БЫСТРЫЙ ПЛАН Б
-BE_LEVEL = 0.0015     # ИЗМЕНЕНО: Безубыток на 0.15% (активируется раньше, т.к. цель короткая)
+BE_LEVEL = 0.0015     # Безубыток на +0.15%
 MAX_TIME = 3600      
-
-# Переменная для исключения дублей (в памяти процесса)
-last_processed_trade_id = None 
-# ------------------
 
 def get_binance_client():
     api_key = os.environ.get("BINANCE_API_KEY")
@@ -43,12 +39,10 @@ def update_stats(profit, trade_id):
     
     with open(STATS_FILE, "r") as f:
         content = f.read().strip().split(",")
-        # Формат: кол-во, профит, id_последней_сделки
         count = int(content[0])
         total_profit = float(content[1])
         last_id = content[2] if len(content) > 2 else ""
 
-    # Если мы этот ID еще не записывали в файл
     if str(trade_id) != last_id:
         count += 1
         total_profit += profit
@@ -74,17 +68,15 @@ def open_trade(client, side, price):
 
         order_side, close_side = ('BUY', 'SELL') if side == "LONG" else ('SELL', 'BUY')
         
-        # --- ИНТЕГРАЦИЯ ЛОГИКИ 50 ЦЕНТОВ ---
-        # 0.50$ прибыли / 0.25 BNB объема = Нужен ход цены 2.0 USDT
+        # РАСЧЕТ ДЛЯ ЦЕЛИ В 0.50 USDT
         profit_step = 2.0 
         
         if side == "LONG":
             take_p = round(price + profit_step, 2)
-            stop_p = round(price - 1.5, 2) # Стоп фиксированный 1.5$ (баланс риска)
+            stop_p = round(price - 1.5, 2)
         else:
             take_p = round(price - profit_step, 2)
             stop_p = round(price + 1.5, 2)
-        # -----------------------------------
         
         client.futures_create_order(symbol=SYMBOL, side=order_side, type='LIMIT',
             timeInForce='GTC', quantity=QTY_BNB, price=str(round(price, 2)))
@@ -95,14 +87,15 @@ def open_trade(client, side, price):
         client.futures_create_order(symbol=SYMBOL, side=close_side, type='LIMIT',
             timeInForce='GTC', price=str(take_p), quantity=QTY_BNB, reduceOnly=True)
         
-        send_tg(f"⚡️ *ВХОД {side}* (Цель 0.50$)\nВход: `{price}` | Тейк: `{take_p}`")
+        send_tg(f"🎯 *ВХОД {side}* (Цель 0.50$)\nВход: `{price}` | Тейк: `{take_p}`")
     except Exception as e:
         send_tg(f"❌ Ошибка открытия: {e}")
 
-@app.route('/')
-def run_bot():
+# --- ГЛАВНАЯ ЛОГИКА ТОРГОВЛИ ---
+def main_trading_logic():
     client = get_binance_client()
-    if not client: return "API Keys Missing", 500
+    if not client: return "API Keys Missing"
+    
     try:
         pos = client.futures_position_information(symbol=SYMBOL)
         active_pos = [p for p in pos if float(p['positionAmt']) != 0]
@@ -114,7 +107,6 @@ def run_bot():
             trade_time = int(p['updateTime']) / 1000
             curr_p = float(client.futures_symbol_ticker(symbol=SYMBOL)['price'])
             
-            # 1. ТАЙМ-АУТ
             if (time.time() - trade_time) > MAX_TIME:
                 side = 'SELL' if amt > 0 else 'BUY'
                 client.futures_create_order(symbol=SYMBOL, side=side, type='MARKET', quantity=abs(amt), reduceOnly=True)
@@ -122,7 +114,6 @@ def run_bot():
                 send_tg("⏰ Выход по времени (60 мин)")
                 return "Closed by time"
 
-            # 2. БЕЗУБЫТОК
             pnl_pct = (curr_p - entry_p) / entry_p if amt > 0 else (entry_p - curr_p) / entry_p
             if pnl_pct >= BE_LEVEL:
                 orders = client.futures_get_open_orders(symbol=SYMBOL)
@@ -136,10 +127,8 @@ def run_bot():
             
             return f"В сделке. PNL: {pnl_pct*100:.2f}%"
 
-        # ЕСЛИ ПОЗИЦИИ НЕТ
         open_orders = client.futures_get_open_orders(symbol=SYMBOL)
         if not open_orders:
-            # Проверка последней сделки для статистики
             trades = client.futures_account_trades(symbol=SYMBOL, limit=1)
             if trades:
                 last_t = trades[0]
@@ -159,9 +148,25 @@ def run_bot():
                     elif curr_p >= ask_p - (ask_p - bid_p) * 0.2:
                         open_trade(client, "SHORT", ask_p - 0.15)
 
-        return "Сканирую стакан на 1000 BNB..."
+        return "Сканирую стакан..."
     except Exception as e:
-        return f"Ошибка: {e}", 400
+        return f"Ошибка: {e}"
+
+# --- ЭНДПОИНТЫ ДЛЯ КРОНА ---
+
+@app.route('/')
+def run_fast():
+    return main_trading_logic()
+
+@app.route('/wait20')
+def run_20():
+    time.sleep(20)
+    return main_trading_logic()
+
+@app.route('/wait40')
+def run_40():
+    time.sleep(40)
+    return main_trading_logic()
 
 if __name__ == "__main__":
     app.run(host='0.0.0.0', port=10000)
