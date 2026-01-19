@@ -17,7 +17,7 @@ AGGREGATION = 0.5
 STATS_FILE = "stats_v2.txt"
 
 # БЫСТРЫЙ ПЛАН Б
-BE_LEVEL = 0.0025   
+BE_LEVEL = 0.0015   
 MAX_TIME = 3600     
 
 # Переменная для исключения дублей (в памяти процесса)
