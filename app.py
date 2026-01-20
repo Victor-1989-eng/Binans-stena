@@ -11,13 +11,13 @@ app = Flask(__name__)
 SYMBOL = 'BNBUSDT'
 LEVERAGE = 75
 QTY_BNB = 0.24
-WALL_SIZE = 1100     # Твоя настройка "Миллионер"
+WALL_SIZE = 1200     # Твоя настройка "Миллионер"
 RANGE_MAX = 0.015
 AGGREGATION = 0.5
 STATS_FILE = "stats_v2.txt"
 
 # БЫСТРЫЙ ПЛАН Б
-BE_LEVEL = 0.0025   
+BE_LEVEL = 0.0015   
 MAX_TIME = 3600     
 
 # Переменная для исключения дублей (в памяти процесса)
