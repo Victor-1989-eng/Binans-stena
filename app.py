@@ -5,14 +5,14 @@ from binance.enums import *
 
 app = Flask(__name__)
 
-# --- НАСТРОЙКИ "УМНОГО СНАЙПЕРА" ---
+# --- НАСТРОЙКИ ПОВЫШЕННОЙ БЕЗОПАСНОСТИ ---
 SYMBOL = 'BNBUSDT'
 LEVERAGE = 50
-QTY_BNB = 0.24       # Безопасный объем для теста новой логики
-WALL_SIZE = 1600     # Только огромные стены (фильтр фейков)
-RANGE_MAX = 0.003    # Вход только если цена почти касается стены (0.3%)
-CALLBACK_RATE = 1.0  # Трейлинг-стоп идет в 0.3% за ценой
-LAST_CHECK_TIME = 0  # Защита от частых вызовов
+QTY_BNB = 0.20       # Оптимальный объем для твоей маржи
+WALL_SIZE = 1900     # Ищем только "бетонные" стены
+RANGE_MAX = 0.002    # Вход только впритык к стене (0.2%)
+CALLBACK_RATE = 1.0  # Трейлинг-стоп 1% (минимизируем шум)
+LAST_CHECK_TIME = 0
 
 def get_binance_client():
     api_key = os.environ.get("BINANCE_API_KEY")
@@ -30,7 +30,6 @@ def send_tg(text):
 def find_whale_walls(data):
     for p, q in data:
         p_val = float(p)
-        # Суммируем плотность в радиусе 0.5 USDT
         vol = sum([float(raw_q) for raw_p, raw_q in data if abs(float(raw_p) - p_val) <= 0.5])
         if vol >= WALL_SIZE: return p_val, vol
     return None, 0
@@ -40,70 +39,73 @@ def open_trade(client, side, entry_price, target_wall_price=None):
         client.futures_change_leverage(symbol=SYMBOL, leverage=LEVERAGE)
         order_side, close_side = ('BUY', 'SELL') if side == "LONG" else ('SELL', 'BUY')
         
-        # 1. Вход по рынку (MARKET)
+        # 1. Вход по рынку
         client.futures_create_order(symbol=SYMBOL, side=order_side, type='MARKET', quantity=QTY_BNB)
-        time.sleep(1.5) # Пауза для стабильности API
+        time.sleep(2) # Даем API Binance время обновить баланс
 
-        # 2. Основной защитный СТОП-ЛОСС (0.5%)
-        stop_p = round(entry_price * 0.995 if side == "LONG" else entry_price * 1.005, 2)
-        client.futures_create_order(symbol=SYMBOL, side=close_side, type='STOP_MARKET', 
-                                    stopPrice=str(stop_p), closePosition=True)
-        
-        # 3. ТРЕЙЛИНГ-СТОП (Активируется у встречной стены или при +0.5%)
+        # 2. Трейлинг-стоп (Активация при движении на 0.5% или у стены)
         activation_p = target_wall_price if target_wall_price else round(entry_price * 1.005 if side == "LONG" else entry_price * 0.995, 2)
         
         client.futures_create_order(
-            symbol=SYMBOL,
-            side=close_side,
-            type='TRAILING_STOP_MARKET',
-            quantity=QTY_BNB,
-            callbackRate=CALLBACK_RATE,
-            activationPrice=str(activation_p),
-            reduceOnly=True
+            symbol=SYMBOL, side=close_side, type='TRAILING_STOP_MARKET',
+            quantity=QTY_BNB, callbackRate=CALLBACK_RATE,
+            activationPrice=str(activation_p), reduceOnly=True
         )
         
-        send_tg(f"🚀 *ВХОД {side}* (Стена: {WALL_SIZE})\n📈 Трейлинг после: `{activation_p}`\n🛡 Стоп: `{stop_p}`")
+        # 3. Обычный защитный СТОП-ЛОСС (0.6% - чуть дальше от "бритвы")
+        stop_p = round(entry_price * 0.994 if side == "LONG" else entry_price * 1.006, 2)
+        client.futures_create_order(
+            symbol=SYMBOL, side=close_side, type='STOP_MARKET', 
+            stopPrice=str(stop_p), closePosition=True
+        )
+        
+        send_tg(f"✅ *ВХОД {side}* (Стена: {WALL_SIZE})\n📈 Трейлинг после: `{activation_p}`\n🛡 Стоп: `{stop_p}`")
     except Exception as e:
-        send_tg(f"❌ Ошибка входа/трейлинга: {e}")
+        send_tg(f"❌ Ошибка входа: {e}")
 
 @app.route('/')
 def run_bot():
     global LAST_CHECK_TIME
     now = time.time()
     
-    # Защита от вызовов чаще 50 секунд
+    # Защита от суеты (раз в 50 сек)
     if now - LAST_CHECK_TIME < 50:
-        return f"Пауза... Прошло {int(now - LAST_CHECK_TIME)} сек. Работаем раз в минуту."
+        return f"Ожидание... Осталось {int(50 - (now - LAST_CHECK_TIME))} сек."
     
     LAST_CHECK_TIME = now
     client = get_binance_client()
     if not client: return "API Keys Missing", 500
 
     try:
-        # Проверка открытых позиций
+        # ПРОВЕРКА ПОЗИЦИИ И ОЧИСТКА МУСОРА
         pos = client.futures_position_information(symbol=SYMBOL)
         active_pos = [p for p in pos if float(p['positionAmt']) != 0]
         
-        if active_pos:
-            return "В сделке. Трейлинг-стоп следит за ценой..."
-
-        # Анализ стакана
-        depth = client.futures_order_book(symbol=SYMBOL, limit=100)
-        curr_p = float(client.futures_symbol_ticker(symbol=SYMBOL)['price'])
-        
-        bid_p, bid_v = find_whale_walls(depth['bids'])
-        ask_p, ask_v = find_whale_walls(depth['asks'])
-
-        # Логика входа от стен
-        if bid_p and (curr_p - bid_p) / bid_p <= RANGE_MAX:
-            open_trade(client, "LONG", curr_p, target_wall_price=ask_p)
-            return f"Открыт LONG от стены {bid_v}"
+        if not active_pos:
+            # Если позиции нет, а ордера висят — чистим всё!
+            open_orders = client.futures_get_open_orders(symbol=SYMBOL)
+            if open_orders:
+                client.futures_cancel_all_open_orders(symbol=SYMBOL)
+                send_tg("🧹 Позиция закрыта. Лишние ордера удалены автоматически.")
             
-        elif ask_p and (ask_p - curr_p) / ask_p <= RANGE_MAX:
-            open_trade(client, "SHORT", curr_p, target_wall_price=bid_p)
-            return f"Открыт SHORT от стены {ask_v}"
+            # Ищем новую сделку
+            depth = client.futures_order_book(symbol=SYMBOL, limit=100)
+            curr_p = float(client.futures_symbol_ticker(symbol=SYMBOL)['price'])
+            
+            bid_p, bid_v = find_whale_walls(depth['bids'])
+            ask_p, ask_v = find_whale_walls(depth['asks'])
 
-        return f"Сканирую... Цена: {curr_p}. Крупных стен рядом нет."
+            if bid_p and (curr_p - bid_p) / bid_p <= RANGE_MAX:
+                open_trade(client, "LONG", curr_p, target_wall_price=ask_p)
+                return "Открываю LONG"
+                
+            elif ask_p and (ask_p - curr_p) / ask_p <= RANGE_MAX:
+                open_trade(client, "SHORT", curr_p, target_wall_price=bid_p)
+                return "Открываю SHORT"
+
+            return f"Цена: {curr_p}. Жду стену {WALL_SIZE}+"
+
+        return "В сделке. Трейлинг работает."
         
     except Exception as e:
         return f"Ошибка: {e}"
