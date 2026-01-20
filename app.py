@@ -1,28 +1,18 @@
-import os
-import requests
-import time
+import os, requests, time
 from flask import Flask
 from binance.client import Client
 from binance.enums import *
 
 app = Flask(__name__)
 
-# --- НАСТРОЙКИ СКОРОСТНОГО СКАТЫВАНИЯ ---
+# --- НАСТРОЙКИ "УМНОГО СНАЙПЕРА" ---
 SYMBOL = 'BNBUSDT'
-LEVERAGE = 75
-QTY_BNB = 0.14
-WALL_SIZE = 1200     # Твоя настройка "Миллионер"
-RANGE_MAX = 0.015
-AGGREGATION = 0.5
-STATS_FILE = "stats_v2.txt"
-
-# БЫСТРЫЙ ПЛАН Б
-BE_LEVEL = 0.0015   
-MAX_TIME = 3600     
-
-# Переменная для исключения дублей (в памяти процесса)
-last_processed_trade_id = None 
-# ------------------
+LEVERAGE = 50
+QTY_BNB = 0.24       # Безопасный объем для теста новой логики
+WALL_SIZE = 1600     # Только огромные стены (фильтр фейков)
+RANGE_MAX = 0.003    # Вход только если цена почти касается стены (0.3%)
+CALLBACK_RATE = 0.3  # Трейлинг-стоп идет в 0.3% за ценой
+LAST_CHECK_TIME = 0  # Защита от частых вызовов
 
 def get_binance_client():
     api_key = os.environ.get("BINANCE_API_KEY")
@@ -37,122 +27,86 @@ def send_tg(text):
         try: requests.post(url, json={"chat_id": chat_id, "text": text, "parse_mode": "Markdown"})
         except: pass
 
-def update_stats(profit, trade_id):
-    if not os.path.exists(STATS_FILE):
-        with open(STATS_FILE, "w") as f: f.write(f"0,0.0,{trade_id}")
-    
-    with open(STATS_FILE, "r") as f:
-        content = f.read().strip().split(",")
-        # Формат: кол-во, профит, id_последней_сделки
-        count = int(content[0])
-        total_profit = float(content[1])
-        last_id = content[2] if len(content) > 2 else ""
-
-    # Если мы этот ID еще не записывали в файл
-    if str(trade_id) != last_id:
-        count += 1
-        total_profit += profit
-        with open(STATS_FILE, "w") as f:
-            f.write(f"{count},{total_profit},{trade_id}")
-        
-        if count % 10 == 0:
-            res = "🟢 ПРОФИТ" if total_profit > 0 else "🔴 УБЫТОК"
-            send_tg(f"📊 *ИТОГ 10 СДЕЛОК*: `{total_profit:.2f} USDT` ({res})")
-
 def find_whale_walls(data):
     for p, q in data:
         p_val = float(p)
-        vol = sum([float(raw_q) for raw_p, raw_q in data if abs(float(raw_p) - p_val) <= AGGREGATION])
+        # Суммируем плотность в радиусе 0.5 USDT
+        vol = sum([float(raw_q) for raw_p, raw_q in data if abs(float(raw_p) - p_val) <= 0.5])
         if vol >= WALL_SIZE: return p_val, vol
     return None, 0
 
-def open_trade(client, side, price):
+def open_trade(client, side, entry_price, target_wall_price=None):
     try:
         client.futures_change_leverage(symbol=SYMBOL, leverage=LEVERAGE)
-        try: client.futures_change_margin_type(symbol=SYMBOL, marginType='ISOLATED')
-        except: pass
-
         order_side, close_side = ('BUY', 'SELL') if side == "LONG" else ('SELL', 'BUY')
         
-        client.futures_create_order(symbol=SYMBOL, side=order_side, type='LIMIT',
-            timeInForce='GTC', quantity=QTY_BNB, price=str(round(price, 2)))
+        # 1. Вход по рынку (MARKET)
+        client.futures_create_order(symbol=SYMBOL, side=order_side, type='MARKET', quantity=QTY_BNB)
+        time.sleep(1.5) # Пауза для стабильности API
+
+        # 2. Основной защитный СТОП-ЛОСС (0.5%)
+        stop_p = round(entry_price * 0.995 if side == "LONG" else entry_price * 1.005, 2)
+        client.futures_create_order(symbol=SYMBOL, side=close_side, type='STOP_MARKET', 
+                                    stopPrice=str(stop_p), closePosition=True)
         
-        stop_p = round(price * 0.996 if side == "LONG" else price * 1.004, 2)
-        take_p = round(price * 1.0055 if side == "LONG" else price * 0.9945, 2)
+        # 3. ТРЕЙЛИНГ-СТОП (Активируется у встречной стены или при +0.5%)
+        activation_p = target_wall_price if target_wall_price else round(entry_price * 1.005 if side == "LONG" else entry_price * 0.995, 2)
         
-        client.futures_create_order(symbol=SYMBOL, side=close_side, type='STOP_MARKET',
-            stopPrice=str(stop_p), closePosition=True)
+        client.futures_create_order(
+            symbol=SYMBOL,
+            side=close_side,
+            type='TRAILING_STOP_MARKET',
+            quantity=QTY_BNB,
+            callbackRate=CALLBACK_RATE,
+            activationPrice=str(activation_p),
+            reduceOnly=True
+        )
         
-        client.futures_create_order(symbol=SYMBOL, side=close_side, type='LIMIT',
-            timeInForce='GTC', price=str(take_p), quantity=QTY_BNB, reduceOnly=True)
-        
-        send_tg(f"⚡️ *ВХОД {side}* по `{price}`\n🛡 SL: `{stop_p}` | 🎯 TP: `{take_p}`")
+        send_tg(f"🚀 *ВХОД {side}* (Стена: {WALL_SIZE})\n📈 Трейлинг после: `{activation_p}`\n🛡 Стоп: `{stop_p}`")
     except Exception as e:
-        send_tg(f"❌ Ошибка открытия: {e}")
+        send_tg(f"❌ Ошибка входа/трейлинга: {e}")
 
 @app.route('/')
 def run_bot():
+    global LAST_CHECK_TIME
+    now = time.time()
+    
+    # Защита от вызовов чаще 50 секунд
+    if now - LAST_CHECK_TIME < 50:
+        return f"Пауза... Прошло {int(now - LAST_CHECK_TIME)} сек. Работаем раз в минуту."
+    
+    LAST_CHECK_TIME = now
     client = get_binance_client()
     if not client: return "API Keys Missing", 500
+
     try:
+        # Проверка открытых позиций
         pos = client.futures_position_information(symbol=SYMBOL)
         active_pos = [p for p in pos if float(p['positionAmt']) != 0]
         
         if active_pos:
-            p = active_pos[0]
-            amt = float(p['positionAmt'])
-            entry_p = float(p['entryPrice'])
-            trade_time = int(p['updateTime']) / 1000
-            curr_p = float(client.futures_symbol_ticker(symbol=SYMBOL)['price'])
+            return "В сделке. Трейлинг-стоп следит за ценой..."
+
+        # Анализ стакана
+        depth = client.futures_order_book(symbol=SYMBOL, limit=100)
+        curr_p = float(client.futures_symbol_ticker(symbol=SYMBOL)['price'])
+        
+        bid_p, bid_v = find_whale_walls(depth['bids'])
+        ask_p, ask_v = find_whale_walls(depth['asks'])
+
+        # Логика входа от стен
+        if bid_p and (curr_p - bid_p) / bid_p <= RANGE_MAX:
+            open_trade(client, "LONG", curr_p, target_wall_price=ask_p)
+            return f"Открыт LONG от стены {bid_v}"
             
-            # 1. ТАЙМ-АУТ
-            if (time.time() - trade_time) > MAX_TIME:
-                side = 'SELL' if amt > 0 else 'BUY'
-                client.futures_create_order(symbol=SYMBOL, side=side, type='MARKET', quantity=abs(amt), reduceOnly=True)
-                client.futures_cancel_all_open_orders(symbol=SYMBOL)
-                send_tg("⏰ Выход по времени (60 мин)")
-                return "Closed by time"
+        elif ask_p and (ask_p - curr_p) / ask_p <= RANGE_MAX:
+            open_trade(client, "SHORT", curr_p, target_wall_price=bid_p)
+            return f"Открыт SHORT от стены {ask_v}"
 
-            # 2. БЕЗУБЫТОК
-            pnl_pct = (curr_p - entry_p) / entry_p if amt > 0 else (entry_p - curr_p) / entry_p
-            if pnl_pct >= BE_LEVEL:
-                orders = client.futures_get_open_orders(symbol=SYMBOL)
-                for o in orders:
-                    if o['type'] == 'STOP_MARKET' and float(o['stopPrice']) != entry_p:
-                        client.futures_cancel_order(symbol=SYMBOL, orderId=o['orderId'])
-                        side = 'SELL' if amt > 0 else 'BUY'
-                        client.futures_create_order(symbol=SYMBOL, side=side, type='STOP_MARKET',
-                            stopPrice=str(entry_p), closePosition=True)
-                        send_tg("🛡 Безубыток активен (+0.25%)")
-            
-            return f"В сделке. PNL: {pnl_pct*100:.2f}%"
-
-        # ЕСЛИ ПОЗИЦИИ НЕТ
-        open_orders = client.futures_get_open_orders(symbol=SYMBOL)
-        if not open_orders:
-            # Проверка последней сделки для статистики
-            trades = client.futures_account_trades(symbol=SYMBOL, limit=1)
-            if trades:
-                last_t = trades[0]
-                realized_pnl = float(last_t['realizedPnl'])
-                if realized_pnl != 0:
-                    update_stats(realized_pnl, last_t['id'])
-            
-            depth = client.futures_order_book(symbol=SYMBOL, limit=100)
-            bid_p, _ = find_whale_walls(depth['bids'])
-            ask_p, _ = find_whale_walls(depth['asks'])
-
-            if bid_p and ask_p:
-                gap, curr_p = (ask_p - bid_p) / bid_p, float(depth['bids'][0][0])
-                if gap <= RANGE_MAX:
-                    if curr_p <= bid_p + (ask_p - bid_p) * 0.2:
-                        open_trade(client, "LONG", bid_p + 0.15)
-                    elif curr_p >= ask_p - (ask_p - bid_p) * 0.2:
-                        open_trade(client, "SHORT", ask_p - 0.15)
-
-        return "Сканирую стакан на 1000 BNB..."
+        return f"Сканирую... Цена: {curr_p}. Крупных стен рядом нет."
+        
     except Exception as e:
-        return f"Ошибка: {e}", 400
+        return f"Ошибка: {e}"
 
 if __name__ == "__main__":
     app.run(host='0.0.0.0', port=10000)
