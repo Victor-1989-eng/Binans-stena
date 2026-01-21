@@ -5,20 +5,15 @@ from binance.enums import *
 
 app = Flask(__name__)
 
-# --- НАСТРОЙКИ HUNTER 3.0 ---
+# --- НАСТРОЙКИ АНТИ-СНАЙПЕРА (РЕВЕРС) ---
 SYMBOL = 'BNBUSDT'
-LEVERAGE = 50
-QTY_BNB = 0.20          # Увеличенный объем для профита
-WALL_SIZE = 1800        # Ищем только серьезных китов
-REJECTION_PCT = 0.0015  # Вход только ПОСЛЕ отскока от пика на 0.15%
-TP_LIMIT_PCT = 0.007    # Лимитка на +0.7% (быстрый выход Maker)
-STOP_LOSS_PCT = 0.008   # Стоп 0.9% (даем цене подышать после прокола)
-CALLBACK_RATE = 1.0     # Трейлинг оставляем как страховку
+LEVERAGE = 50        # Снизили с 75 до 50 для выживания
+QTY_BNB = 0.10       # Объем
+WALL_SIZE = 1000     # Ищем средние стены, которые легко "прогрызть"
+PROBOY_DIST = 0.001  # Заходим, когда до стены осталось 0.1% цены
+TP_PCT = 0.004       # Забираем быстрый импульс 0.4%
+SL_PCT = 0.006       # Стоп 0.6% (с другой стороны стены)
 LAST_CHECK_TIME = 0
-
-# Состояния для логики "Hunter"
-PENDING_WALL = None     # Цена стены, которую "прокололи"
-PEAK_PRICE = 0          # Максимальный прокол для расчета отскока
 
 def get_binance_client():
     api_key = os.environ.get("BINANCE_API_KEY")
@@ -33,88 +28,77 @@ def send_tg(text):
         try: requests.post(url, json={"chat_id": chat_id, "text": text, "parse_mode": "Markdown"})
         except: pass
 
-def find_whale_walls(data):
+def find_walls(data):
     for p, q in data:
-        p_val = float(p)
-        vol = sum([float(raw_q) for raw_p, raw_q in data if abs(float(raw_p) - p_val) <= 0.4])
-        if vol >= WALL_SIZE: return p_val, vol
-    return None, 0
+        if float(q) >= WALL_SIZE: return float(p)
+    return None
 
-def open_trade(client, side, entry_p):
+def open_reverse_trade(client, side, curr_p):
     try:
         client.futures_change_leverage(symbol=SYMBOL, leverage=LEVERAGE)
-        order_side, close_side = ('BUY', 'SELL') if side == "LONG" else ('SELL', 'BUY')
         
-        # 1. Вход по рынку (на подтвержденном отскоке)
+        # РЕВЕРС ЛОГИКА: 
+        # Видим стену снизу (LONG сигнал) -> Открываем SHORT (на пробой)
+        # Видим стену сверху (SHORT сигнал) -> Открываем LONG (на пробой)
+        if side == "SHORT_PROBOY": # Снесли стену ASK
+            order_side, close_side = 'BUY', 'SELL'
+            tp_p = round(curr_p * (1 + TP_PCT), 2)
+            sl_p = round(curr_p * (1 - SL_PCT), 2)
+        else: # Снесли стену BID
+            order_side, close_side = 'SELL', 'BUY'
+            tp_p = round(curr_p * (1 - TP_PCT), 2)
+            sl_p = round(curr_p * (1 + SL_PCT), 2)
+
+        # 1. Вход по рынку на импульсе
         client.futures_create_order(symbol=SYMBOL, side=order_side, type='MARKET', quantity=QTY_BNB)
         
-        # 2. УМНЫЙ ВЫХОД: Лимитка на +0.7% (Берет профит без комиссии Тейкера)
-        tp_p = round(entry_p * 1.007 if side == "LONG" else entry_p * 0.993, 2)
-        client.futures_create_order(
-            symbol=SYMBOL, side=close_side, type='LIMIT', 
-            quantity=QTY_BNB, price=str(tp_p), timeInForce='GTC', reduceOnly=True
-        )
+        # 2. Тейк-профит лимиткой
+        client.futures_create_order(symbol=SYMBOL, side=close_side, type='LIMIT', 
+                                    price=str(tp_p), quantity=QTY_BNB, timeInForce='GTC', reduceOnly=True)
+        
+        # 3. Стоп-лосс
+        client.futures_create_order(symbol=SYMBOL, side=close_side, type='STOP_MARKET', 
+                                    stopPrice=str(sl_p), closePosition=True)
 
-        # 3. ЗАЩИТНЫЙ СТОП: 0.9% от точки входа
-        sl_p = round(entry_p * 0.991 if side == "LONG" else entry_p * 1.009, 2)
-        client.futures_create_order(
-            symbol=SYMBOL, side=close_side, type='STOP_MARKET', 
-            stopPrice=str(sl_p), closePosition=True
-        )
-
-        send_tg(f"🎯 *HUNTER ВХОД {side}* по `{entry_p}`\n💰 Лимитка: `{tp_p}`\n🛡 Стоп: `{sl_p}`")
+        send_tg(f"🔄 *АНТИ-СНАЙПЕР: РЕВЕРС {order_side}*\n🚀 Вход на пробой стены!\n🎯 Тейк: `{tp_p}`\n🛡 Стоп: `{sl_p}`")
     except Exception as e:
-        send_tg(f"❌ Ошибка Hunter-входа: {e}")
+        send_tg(f"❌ Ошибка реверса: {e}")
 
 @app.route('/')
 def run_bot():
-    global LAST_CHECK_TIME, PENDING_WALL, PEAK_PRICE
+    global LAST_CHECK_TIME
     now = time.time()
-    if now - LAST_CHECK_TIME < 5: # Охотник должен проверять чаще (раз в 5 сек)
-        return "Сканирую импульс..."
-    
+    if now - LAST_CHECK_TIME < 10: return "Жду импульс..."
     LAST_CHECK_TIME = now
+
     client = get_binance_client()
-    if not client: return "API Keys Missing"
+    if not client: return "No API Keys"
 
     try:
         pos = client.futures_position_information(symbol=SYMBOL)
-        active_pos = [p for p in pos if float(p['positionAmt']) != 0]
+        if any(float(p['positionAmt']) != 0 for p in pos):
+            return "В сделке..."
 
-        if not active_pos:
-            # Очистка, если вышли из сделки
-            if PENDING_WALL:
-                client.futures_cancel_all_open_orders(symbol=SYMBOL)
-                PENDING_WALL = None
-                PEAK_PRICE = 0
+        # Чистим старые ордера, если сделка закрылась
+        client.futures_cancel_all_open_orders(symbol=SYMBOL)
 
-            curr_p = float(client.futures_symbol_ticker(symbol=SYMBOL)['price'])
-            depth = client.futures_order_book(symbol=SYMBOL, limit=100)
-            
-            bid_p, bid_v = find_whale_walls(depth['bids']) # Стены LONG
-            ask_p, ask_v = find_whale_walls(depth['asks']) # Стены SHORT
+        depth = client.futures_order_book(symbol=SYMBOL, limit=100)
+        curr_p = float(client.futures_symbol_ticker(symbol=SYMBOL)['price'])
+        
+        bid_wall = find_walls(depth['bids'])
+        ask_wall = find_walls(depth['asks'])
 
-            # ЛОГИКА ОХОТЫ ЗА LONG (отскок от стены снизу)
-            if bid_p and curr_p <= bid_p: # Цена коснулась или пробила стену вниз
-                PENDING_WALL = bid_p
-                if PEAK_PRICE == 0 or curr_p < PEAK_PRICE: PEAK_PRICE = curr_p
-            
-            if PENDING_WALL and curr_p >= PEAK_PRICE * (1 + REJECTION_PCT):
-                open_trade(client, "LONG", curr_p)
-                return "Hunter зашел в LONG"
+        # Если цена подошла к стене BUY (снизу) — открываем SHORT на пробой
+        if bid_wall and (curr_p - bid_wall) / bid_wall <= PROBOY_DIST:
+            open_reverse_trade(client, "LONG_PROBOY", curr_p)
+            return "Ломаю стену BUY (Вход в SHORT)"
 
-            # ЛОГИКА ОХОТЫ ЗА SHORT (отскок от стены сверху)
-            if ask_p and curr_p >= ask_p: # Цена коснулась или пробила стену вверх
-                PENDING_WALL = ask_p
-                if PEAK_PRICE == 0 or curr_p > PEAK_PRICE: PEAK_PRICE = curr_p
-            
-            if PENDING_WALL and curr_p <= PEAK_PRICE * (1 - REJECTION_PCT):
-                open_trade(client, "SHORT", curr_p)
-                return "Hunter зашел в SHORT"
+        # Если цена подошла к стене SELL (сверху) — открываем LONG на пробой
+        if ask_wall and (ask_wall - curr_p) / ask_wall <= PROBOY_DIST:
+            open_reverse_trade(client, "SHORT_PROBOY", curr_p)
+            return "Ломаю стену SELL (Вход в LONG)"
 
-            return f"Цена: {curr_p}. Стены: L:{bid_p} / S:{ask_p}"
-
-        return "Слежу за позицией..."
+        return f"Слежу за BNB: {curr_p}"
     except Exception as e:
         return f"Ошибка: {e}"
 
