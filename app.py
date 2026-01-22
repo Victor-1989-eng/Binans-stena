@@ -6,10 +6,8 @@ from binance.enums import *
 app = Flask(__name__)
 
 # --- НАСТРОЙКИ ПОД $5 ---
-SYMBOLS = [SYMBOLS = [
-    'BTCUSDT', 'ETHUSDT', 'SOLUSDT', 'BNBUSDT', 
-    'XRPUSDT', 'ADAUSDT', 'LINKUSDT', 'DOGEUSDT', 'AVAXUSDT'
-]]  # Для $5 лучше 1-2 монеты
+SYMBOLS = [ 'BTCUSDT', 'ETHUSDT', 'SOLUSDT', 'BNBUSDT', 'XRPUSDT', 'ADAUSDT', 'LINKUSDT', 'DOGEUSDT', 'AVAXUSDT'
+]  # Для $5 лучше 1-2 монеты
 LEVERAGE = 20
 QTY_USD = 5            # Твоя маржа на сделку
 TP_PCT = 0.02          # Тейк 2%
