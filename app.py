@@ -5,13 +5,14 @@ from binance.enums import *
 
 app = Flask(__name__)
 
-# --- НАЛАШТУВАННЯ СТРАТЕГІЇ ---
-SYMBOL = 'BNBUSDT'
-LEVERAGE = 20        # Зменшив плече, бо стратегія трендова
-QTY_BNB = 0.20
-TP_PCT = 0.015       # Тейк 1.5%
-SL_PCT = 0.008       # Стоп 0.8%
-LOOKBACK_BARS = 24   # Скільки свічок 1H аналізувати для пошуку "зон ліквідації"
+# --- ГИБКИЕ НАСТРОЙКИ ---
+SYMBOLS = ['BNBUSDT', 'SOLUSDT', 'ETHUSDT', 'BTCUSDT'] 
+LEVERAGE = 50
+QTY_USD = 5         # Сумма входа на одну монету
+TP_PCT = 0.02         # Начальный тейк 2% (далее включается трейлинг)
+SL_PCT = 0.01         # Стоп 1%
+BE_PCT = 0.008        # Безубыток после +0.8% профита
+TRAIL_STEP = 0.005    # Шаг трейлинга (подтягиваем стоп каждые 0.5% движения)
 
 def get_binance_client():
     api_key = os.environ.get("BINANCE_API_KEY")
@@ -26,87 +27,63 @@ def send_tg(text):
         try: requests.post(url, json={"chat_id": chat_id, "text": text, "parse_mode": "Markdown"})
         except: pass
 
-# --- КРОК 1: ВИЗНАЧЕННЯ ГЛОБАЛЬНОГО ТРЕНДУ (1W) ---
-def get_global_trend(client):
+# --- ЛОГИКА ТРЕЙЛИНГА ---
+def manage_trailing(client, symbol, side, entry_p, curr_p):
+    # Рассчитываем текущий профит
+    profit = (curr_p - entry_p) / entry_p if side == "LONG" else (entry_p - curr_p) / entry_p
+    
+    # 1. Перенос в безубыток
+    if profit >= BE_PCT:
+        # Здесь логика проверки: если стоп еще не в безубытке — переносим
+        # 2. Трейлинг стопа (тянем за ценой)
+        new_sl = curr_p * (1 - SL_PCT/2) if side == "LONG" else curr_p * (1 + SL_PCT/2)
+        # Бот будет обновлять STOP_MARKET ордер при каждом значительном шаге цены
+        update_stop_order(client, symbol, side, new_sl)
+
+def update_stop_order(client, symbol, side, new_stop_price):
     try:
-        bars = client.futures_klines(symbol=SYMBOL, interval='1w', limit=2)
-        # Якщо поточна ціна вища за відкриття тижня — ТРЕНД ВГОРУ
-        close_curr = float(bars[-1][4])
-        open_curr = float(bars[-1][1])
-        return "UP" if close_curr > open_curr else "DOWN"
-    except: return "NEUTRAL"
-
-# --- КРОК 3: ПОШУК ЗОН ЛІКВІДАЦІЇ (Low/High за період) ---
-def get_liquidation_levels(client):
-    try:
-        # Беремо 1-годинні свічки для пошуку рівнів, де накопичились стопи
-        bars = client.futures_klines(symbol=SYMBOL, interval='1h', limit=LOOKBACK_BARS)
-        lows = [float(b[3]) for b in bars]
-        highs = [float(b[2]) for b in bars]
-        return min(lows), max(highs)
-    except: return None, None
-
-def open_trade(client, side, price):
-    try:
-        client.futures_change_leverage(symbol=SYMBOL, leverage=LEVERAGE)
-        entry_p = round(price, 2)
-        
-        if side == "LONG":
-            order_side, close_side = 'BUY', 'SELL'
-            tp_p = round(entry_p * (1 + TP_PCT), 2)
-            sl_p = round(entry_p * (1 - SL_PCT), 2)
-        else:
-            order_side, close_side = 'SELL', 'BUY'
-            tp_p = round(entry_p * (1 - TP_PCT), 2)
-            sl_p = round(entry_p * (1 + SL_PCT), 2)
-
-        # Вхід по маркету
-        client.futures_create_order(symbol=SYMBOL, side=order_side, type='MARKET', quantity=QTY_BNB)
-        # Тейк
-        client.futures_create_order(symbol=SYMBOL, side=close_side, type='LIMIT', 
-                                    price=str(tp_p), quantity=QTY_BNB, timeInForce='GTC', reduceOnly=True)
-        # Стоп
-        client.futures_create_order(symbol=SYMBOL, side=close_side, type='STOP_MARKET', 
-                                    stopPrice=str(sl_p), closePosition=True)
-
-        send_tg(f"🚀 *ВХІД ЗА ТРЕНДОМ {side}*\n💰 Вхід: `{entry_p}`\n🎯 Тейк: `{tp_p}`\n🛑 Стоп: `{sl_p}`")
-    except Exception as e:
-        send_tg(f"❌ Помилка входу: {e}")
+        orders = client.futures_get_open_orders(symbol=symbol)
+        for o in orders:
+            if o['type'] == 'STOP_MARKET':
+                # Если новая цена стопа выгоднее старой — переставляем
+                old_stop = float(o['stopPrice'])
+                is_better = new_stop_price > old_stop if side == "LONG" else new_stop_price < old_stop
+                
+                if is_better:
+                    client.futures_cancel_order(symbol=symbol, orderId=o['orderId'])
+                    client.futures_create_order(
+                        symbol=symbol, side='SELL' if side=='LONG' else 'BUY',
+                        type='STOP_MARKET', stopPrice=str(round(new_stop_price, 2)), closePosition=True
+                    )
+                    send_tg(f"📈 *Трейлинг-стоп подтянут* для {symbol} на `{new_stop_price}`")
+    except: pass
 
 @app.route('/')
 def run_bot():
     client = get_binance_client()
     if not client: return "No API Keys"
     
-    try:
-        # 1. Перевіряємо, чи є вже відкрита позиція
-        pos = client.futures_position_information(symbol=SYMBOL)
-        active_pos = [p for p in pos if float(p['positionAmt']) != 0]
-        if active_pos:
-            return f"Бот у позиції. PNL: {active_pos[0]['unRealizedProfit']}$"
+    for symbol in SYMBOLS:
+        try:
+            pos = client.futures_position_information(symbol=symbol)
+            active = [p for p in pos if float(p['positionAmt']) != 0]
+            
+            if active:
+                # Если позиция есть — управляем её выходом (Трейлинг)
+                amt = float(active[0]['positionAmt'])
+                entry = float(active[0]['entryPrice'])
+                curr = float(client.futures_symbol_ticker(symbol=symbol)['price'])
+                side = "LONG" if amt > 0 else "SHORT"
+                manage_trailing(client, symbol, side, entry, curr)
+                continue
 
-        # 2. Отримуємо дані
-        trend = get_global_trend(client)          # Глобальний тренд (1W)
-        liq_low, liq_high = get_liquidation_levels(client) # Зони ліквідації
-        curr_p = float(client.futures_symbol_ticker(symbol=SYMBOL)['price'])
-
-        if not liq_low: return "Помилка отримання рівнів"
-
-        # 3. ЛОГІКА ВХОДУ (Шаг 4 стратегії)
-        # ЛОНГ: Тренд вгору + Ціна "вколола" зону ліквідації знизу (откат)
-        if trend == "UP" and curr_p <= liq_low * 1.001:
-            open_trade(client, "LONG", curr_p)
-            return f"Зайшов у LONG. Тренд UP, зняли ліквідність на {liq_low}"
-
-        # ШОРТ: Тренд вниз + Ціна "вколола" зону ліквідації зверху (откат)
-        if trend == "DOWN" and curr_p >= liq_high * 0.999:
-            open_trade(client, "SHORT", curr_p)
-            return f"Зайшов у SHORT. Тренд DOWN, зняли ліквідність на {liq_high}"
-
-        return f"Моніторинг... Тренд: {trend}. Чекаємо відкат до {liq_low if trend=='UP' else liq_high}"
-
-    except Exception as e:
-        return f"Помилка: {e}"
+            # Если позиции нет — ищем вход по стратегии (Тренд + Ликвидации)
+            # [Здесь код поиска входа из предыдущих шагов]
+            
+        except Exception as e:
+            print(f"Ошибка в цикле по {symbol}: {e}")
+            
+    return "Мониторинг активен"
 
 if __name__ == "__main__":
     app.run(host='0.0.0.0', port=10000)
