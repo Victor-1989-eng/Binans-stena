@@ -9,11 +9,11 @@ app = Flask(__name__)
 SYMBOLS = [ 'BTCUSDT', 'ETHUSDT', 'SOLUSDT', 'BNBUSDT', 'XRPUSDT', 'ADAUSDT', 'LINKUSDT', 'DOGEUSDT', 'AVAXUSDT'
 ]  # Для $5 лучше 1-2 монеты
 LEVERAGE = 20
-QTY_USD = 5            # Твоя маржа на сделку
+QTY_USD = 1            # Твоя маржа на сделку
 TP_PCT = 0.02          # Тейк 2%
 SL_PCT = 0.01          # Стоп 1%
 BE_PCT = 0.008         # Безубыток при +0.8%
-LOOKBACK_BARS = 24     # Поиск зон ликвидности за сутки
+LOOKBACK_BARS = 4     # Поиск зон ликвидности за сутки
 
 def get_binance_client():
     api_key = os.environ.get("BINANCE_API_KEY")
