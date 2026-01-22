@@ -5,14 +5,15 @@ from binance.enums import *
 
 app = Flask(__name__)
 
-# --- НАСТРОЙКИ V13.2 ---
+# --- НАСТРОЙКИ V14 ---
 SYMBOL = 'BNBUSDT'
-LEVERAGE = 50
+LEVERAGE = 75
 QTY_USD = 1 
-WALL_SIZE = 750 
+WALL_SIZE = 900 
 AGGREGATION = 0.3
-PROFIT_TO_UNLOCK = 0.0030 # 0.3% движения для раскрытия
-TP_LEVEL = 0.01          # Тейк-профит 1%
+PROFIT_TO_UNLOCK = 0.0030 # 0.3% для раскрытия замка
+ACTIVATION_PNL = 0.0070   # Активировать трейлинг при +0.7%
+CALLBACK_RATE = 0.0020    # Закрыть, если цена откатилась на 0.2% от пика
 
 def get_binance_client():
     api_key = os.environ.get("BINANCE_API_KEY")
@@ -37,7 +38,7 @@ def run_bot():
         active_s = next((p for p in pos_info if p['positionSide'] == 'SHORT' and float(p['positionAmt']) != 0), None)
         curr_p = float(client.futures_symbol_ticker(symbol=SYMBOL)['price'])
 
-        # 1. ЛОГИКА РАЗБЛОКИРОВКИ + АВТОСТОП
+        # 1. ЛОГИКА РАЗБЛОКИРОВКИ
         if active_l and active_s:
             pnl_l = (curr_p - float(active_l['entryPrice'])) / float(active_l['entryPrice'])
             pnl_s = (float(active_s['entryPrice']) - curr_p) / float(active_s['entryPrice'])
@@ -48,28 +49,39 @@ def run_bot():
                 active_to_close = active_s if side_to_close == 'SHORT' else active_l
                 survivor_pos = active_l if survivor_side == 'LONG' else active_s
                 
-                # Закрываем убыточную сторону по рынку
+                # Закрываем убыточную ногу
                 client.futures_create_order(symbol=SYMBOL, side=SIDE_BUY if side_to_close == 'SHORT' else SIDE_SELL, 
                                             positionSide=side_to_close, type=ORDER_TYPE_MARKET, quantity=abs(float(active_to_close['positionAmt'])))
                 
-                # СТАВИМ РЕАЛЬНЫЙ СТОП В БЕЗУБЫТОК НА БИРЖУ
+                # Ставим БЕЗУБЫТОК сразу на биржу
                 entry_p = float(survivor_pos['entryPrice'])
                 client.futures_create_order(symbol=SYMBOL, side=SIDE_SELL if survivor_side == 'LONG' else SIDE_BUY, 
                                             positionSide=survivor_side, type=ORDER_TYPE_STOP_MARKET, stopPrice=str(round(entry_p, 2)), closePosition=True)
                 
-                # СТАВИМ ТЕЙК-ПРОФИТ 1% НА БИРЖУ
-                tp_price = entry_p * (1 + TP_LEVEL) if survivor_side == 'LONG' else entry_p * (1 - TP_LEVEL)
-                client.futures_create_order(symbol=SYMBOL, side=SIDE_SELL if survivor_side == 'LONG' else SIDE_BUY, 
-                                            positionSide=survivor_side, type=ORDER_TYPE_LIMIT, price=str(round(tp_price, 2)), quantity=abs(float(survivor_pos['positionAmt'])), timeInForce=TIME_IN_FORCE_GTC, reduceOnly=True)
+                send_tg(f"🔓 *РАЗБЛОКИРОВКА:* Оставил {survivor_side}. Стоп в БЕЗУБЫТКЕ. Включаю трейлинг-слежку.")
+                return "Unlocked"
 
-                send_tg(f"🔓 *РАЗБЛОКИРОВКА:* Оставил {survivor_side}. Стоп и Тейк выставлены на биржу!")
-                return "Unlocked and Protected"
-            return "Замок активен. Жду импульс."
-
-        # 2. ЕСЛИ ОСТАЛАСЬ ОДНА ПОЗИЦИЯ (Инфо-статус)
+        # 2. ТРЕЙЛИНГ-СОПРОВОЖДЕНИЕ (Когда осталась одна позиция)
         if active_l or active_s:
             side = 'LONG' if active_l else 'SHORT'
-            return f"Сопровождение {side} (Стопы уже на бирже)."
+            pos = active_l if active_l else active_s
+            entry = float(pos['entryPrice'])
+            pnl = (curr_p - entry) / entry if side == 'LONG' else (entry - curr_p) / entry
+            
+            # Если цена дошла до зоны активации трейлинга
+            if pnl >= ACTIVATION_PNL:
+                # Рассчитываем динамический стоп (откат 0.2% от текущей цены)
+                # Для лонга стоп подтягиваем вверх, для шорта — вниз
+                new_sl = curr_p * (1 - CALLBACK_RATE) if side == 'LONG' else curr_p * (1 + CALLBACK_RATE)
+                
+                # Обновляем стоп-ордер на бирже (удаляем старый безубыток и ставим новый трейлинг)
+                client.futures_cancel_all_open_orders(symbol=SYMBOL)
+                client.futures_create_order(symbol=SYMBOL, side=SIDE_SELL if side == 'LONG' else SIDE_BUY, 
+                                            positionSide=side, type=ORDER_TYPE_STOP_MARKET, stopPrice=str(round(new_sl, 2)), closePosition=True)
+                
+                return f"Трейлинг активен: {side} PNL {pnl*100:.2f}% | SL: {new_sl}"
+
+            return f"Сопровождаю {side}. PNL: {pnl*100:.2f}%"
 
         # 3. ВХОД В ЗАМОК
         depth = client.futures_order_book(symbol=SYMBOL, limit=100)
@@ -78,13 +90,12 @@ def run_bot():
 
         if (bid_p and curr_p <= bid_p + 0.35) or (ask_p and curr_p >= ask_p - 0.35):
             qty = round((QTY_USD * LEVERAGE) / curr_p, 2)
-            # Открываем обе стороны по рынку
             client.futures_create_order(symbol=SYMBOL, side=SIDE_BUY, positionSide='LONG', type=ORDER_TYPE_MARKET, quantity=qty)
             client.futures_create_order(symbol=SYMBOL, side=SIDE_SELL, positionSide='SHORT', type=ORDER_TYPE_MARKET, quantity=qty)
-            send_tg(f"🔒 *ВХОД В ЗАМОК* по {curr_p}. Ожидаю развязку.")
+            send_tg(f"🔒 *ЗАМОК* по {curr_p}. Жду импульс для трейлинга.")
             return "Hedge Entry"
 
-        return f"Мониторинг. Цена: {curr_p}"
+        return f"Поиск стен... BNB: {curr_p}"
         
     except Exception as e: return f"Ошибка: {e}", 400
 
