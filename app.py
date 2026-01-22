@@ -5,15 +5,13 @@ from binance.enums import *
 
 app = Flask(__name__)
 
-# --- НАСТРОЙКИ TRAP & FLIP V7.2 (ИСПРАВЛЕННЫЙ) ---
+# --- НАЛАШТУВАННЯ СТРАТЕГІЇ ---
 SYMBOL = 'BNBUSDT'
-LEVERAGE = 50
-QTY_BNB = 0.50
-WALL_SIZE = 1200      # Увеличили, чтобы не ловить мелкий шум
-OFFSET_PCT = 0.0015   # Вход при приближении на 0.15%
-TP_PCT = 0.012        # Тейк 1.2% (целимся в нормальное движение)
-SL_PCT = 0.009        # Стоп 0.9% (даем цене пространство, чтобы не было "пилы")
-FLIP_MULT = 1.8       # Коэффициент реверса (0.5 -> 0.9 BNB)
+LEVERAGE = 20        # Зменшив плече, бо стратегія трендова
+QTY_BNB = 0.20
+TP_PCT = 0.015       # Тейк 1.5%
+SL_PCT = 0.008       # Стоп 0.8%
+LOOKBACK_BARS = 24   # Скільки свічок 1H аналізувати для пошуку "зон ліквідації"
 
 def get_binance_client():
     api_key = os.environ.get("BINANCE_API_KEY")
@@ -28,95 +26,87 @@ def send_tg(text):
         try: requests.post(url, json={"chat_id": chat_id, "text": text, "parse_mode": "Markdown"})
         except: pass
 
-def find_walls(data):
-    for p, q in data:
-        if float(q) >= WALL_SIZE: return float(p)
-    return None
+# --- КРОК 1: ВИЗНАЧЕННЯ ГЛОБАЛЬНОГО ТРЕНДУ (1W) ---
+def get_global_trend(client):
+    try:
+        bars = client.futures_klines(symbol=SYMBOL, interval='1w', limit=2)
+        # Якщо поточна ціна вища за відкриття тижня — ТРЕНД ВГОРУ
+        close_curr = float(bars[-1][4])
+        open_curr = float(bars[-1][1])
+        return "UP" if close_curr > open_curr else "DOWN"
+    except: return "NEUTRAL"
 
-def open_flip_trade(client, side, entry_p):
+# --- КРОК 3: ПОШУК ЗОН ЛІКВІДАЦІЇ (Low/High за період) ---
+def get_liquidation_levels(client):
+    try:
+        # Беремо 1-годинні свічки для пошуку рівнів, де накопичились стопи
+        bars = client.futures_klines(symbol=SYMBOL, interval='1h', limit=LOOKBACK_BARS)
+        lows = [float(b[3]) for b in bars]
+        highs = [float(b[2]) for b in bars]
+        return min(lows), max(highs)
+    except: return None, None
+
+def open_trade(client, side, price):
     try:
         client.futures_change_leverage(symbol=SYMBOL, leverage=LEVERAGE)
-        
-        # Исправление ошибки Precision (округляем до 2 знаков)
-        entry_p = round(entry_p, 2)
+        entry_p = round(price, 2)
         
         if side == "LONG":
-            order_side, flip_side = 'BUY', 'SELL'
+            order_side, close_side = 'BUY', 'SELL'
             tp_p = round(entry_p * (1 + TP_PCT), 2)
             sl_p = round(entry_p * (1 - SL_PCT), 2)
         else:
-            order_side, flip_side = 'SELL', 'BUY'
+            order_side, close_side = 'SELL', 'BUY'
             tp_p = round(entry_p * (1 - TP_PCT), 2)
             sl_p = round(entry_p * (1 + SL_PCT), 2)
 
-        # 1. Основной вход
+        # Вхід по маркету
         client.futures_create_order(symbol=SYMBOL, side=order_side, type='MARKET', quantity=QTY_BNB)
-        
-        # 2. Тейк-профит (LIMIT)
-        client.futures_create_order(symbol=SYMBOL, side=flip_side, type='LIMIT', 
+        # Тейк
+        client.futures_create_order(symbol=SYMBOL, side=close_side, type='LIMIT', 
                                     price=str(tp_p), quantity=QTY_BNB, timeInForce='GTC', reduceOnly=True)
-        
-        # 3. Стоп-Перевертыш (STOP_MARKET)
-        flip_qty = round(QTY_BNB * FLIP_MULT, 2)
-        client.futures_create_order(
-            symbol=SYMBOL, side=flip_side, type='STOP_MARKET',
-            stopPrice=str(sl_p), quantity=flip_qty
-        )
+        # Стоп
+        client.futures_create_order(symbol=SYMBOL, side=close_side, type='STOP_MARKET', 
+                                    stopPrice=str(sl_p), closePosition=True)
 
-        send_tg(f"🎯 *ВХОД {side}*\n💰 Тейк: `{tp_p}`\n🔄 Реверс: `{sl_p}` (Объем: {flip_qty})")
+        send_tg(f"🚀 *ВХІД ЗА ТРЕНДОМ {side}*\n💰 Вхід: `{entry_p}`\n🎯 Тейк: `{tp_p}`\n🛑 Стоп: `{sl_p}`")
     except Exception as e:
-        send_tg(f"❌ Ошибка входа: {e}")
+        send_tg(f"❌ Помилка входу: {e}")
 
 @app.route('/')
 def run_bot():
     client = get_binance_client()
     if not client: return "No API Keys"
+    
     try:
+        # 1. Перевіряємо, чи є вже відкрита позиція
         pos = client.futures_position_information(symbol=SYMBOL)
         active_pos = [p for p in pos if float(p['positionAmt']) != 0]
-        
         if active_pos:
-            amt = float(active_pos[0]['positionAmt'])
-            entry_price = float(active_pos[0]['entryPrice'])
-            pnl = active_pos[0]['unRealizedProfit']
-            
-            # --- ПРОВЕРКА НАЛИЧИЯ ТЕЙКА (ДЛЯ РЕВЕРСА) ---
-            open_orders = client.futures_get_open_orders(symbol=SYMBOL)
-            has_tp = any(o['type'] == 'LIMIT' for o in open_orders)
-            
-            if not has_tp:
-                tp_side = 'SELL' if amt > 0 else 'BUY'
-                # Ставим Тейк относительно цены входа
-                tp_price = round(entry_price * (1 + TP_PCT), 2) if amt > 0 else round(entry_price * (1 - TP_PCT), 2)
-                
-                client.futures_create_order(
-                    symbol=SYMBOL, side=tp_side, type='LIMIT', 
-                    price=str(tp_price), quantity=abs(round(amt, 2)), timeInForce='GTC', reduceOnly=True
-                )
-                send_tg(f"🩹 *Тейк восстановлен!* Для позиции {amt} BNB на `{tp_price}`")
+            return f"Бот у позиції. PNL: {active_pos[0]['unRealizedProfit']}$"
 
-            return f"В игре! Позиция: {amt} BNB. PNL: {pnl}$"
-
-        # Если позиции нет — чистим старье и ищем новые стены
-        client.futures_cancel_all_open_orders(symbol=SYMBOL)
-        
-        depth = client.futures_order_book(symbol=SYMBOL, limit=100)
+        # 2. Отримуємо дані
+        trend = get_global_trend(client)          # Глобальний тренд (1W)
+        liq_low, liq_high = get_liquidation_levels(client) # Зони ліквідації
         curr_p = float(client.futures_symbol_ticker(symbol=SYMBOL)['price'])
-        
-        bid_wall = find_walls(depth['bids'])
-        ask_wall = find_walls(depth['asks'])
 
-        if bid_wall and curr_p <= bid_wall * (1 + OFFSET_PCT):
-            open_flip_trade(client, "LONG", curr_p)
-            return f"Зашел в LONG от {bid_wall}"
+        if not liq_low: return "Помилка отримання рівнів"
 
-        if ask_wall and curr_p >= ask_wall * (1 - OFFSET_PCT):
-            open_flip_trade(client, "SHORT", curr_p)
-            return f"Зашел в SHORT от {ask_wall}"
+        # 3. ЛОГІКА ВХОДУ (Шаг 4 стратегії)
+        # ЛОНГ: Тренд вгору + Ціна "вколола" зону ліквідації знизу (откат)
+        if trend == "UP" and curr_p <= liq_low * 1.001:
+            open_trade(client, "LONG", curr_p)
+            return f"Зайшов у LONG. Тренд UP, зняли ліквідність на {liq_low}"
 
-        return f"Мониторю... Цена: {curr_p}. Стен нет (WALL > {WALL_SIZE})"
+        # ШОРТ: Тренд вниз + Ціна "вколола" зону ліквідації зверху (откат)
+        if trend == "DOWN" and curr_p >= liq_high * 0.999:
+            open_trade(client, "SHORT", curr_p)
+            return f"Зайшов у SHORT. Тренд DOWN, зняли ліквідність на {liq_high}"
+
+        return f"Моніторинг... Тренд: {trend}. Чекаємо відкат до {liq_low if trend=='UP' else liq_high}"
+
     except Exception as e:
-        return f"Ошибка цикла: {e}"
+        return f"Помилка: {e}"
 
 if __name__ == "__main__":
     app.run(host='0.0.0.0', port=10000)
