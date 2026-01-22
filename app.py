@@ -9,11 +9,11 @@ app = Flask(__name__)
 SYMBOL = 'BNBUSDT'
 LEVERAGE = 50
 QTY_BNB = 0.05
-WALL_SIZE = 800
+WALL_SIZE = 1200
 OFFSET_PCT = 0.001
-TP_PCT = 0.008       # Тейк 0.8%
-SL_PCT = 0.006       # Стоп 0.6% (точка переворота)
-FLIP_MULT = 2        # Множник (0.5 -> 1.0)
+TP_PCT = 0.015       # Тейк 0.8%
+SL_PCT = 0.010       # Стоп 0.6% (точка переворота)
+FLIP_MULT = 1.5        # Множник (0.5 -> 1.0)
 
 def get_binance_client():
     api_key = os.environ.get("BINANCE_API_KEY")
