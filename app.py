@@ -8,8 +8,8 @@ app = Flask(__name__)
 # --- НАСТРОЙКИ ДЛЯ ZEC/USDC ---
 SYMBOL = 'ZECUSDC' # Переключили на USDC
 LEVERAGE = 20
-QTY_USDC = 2       # Твои 5 USDC
-WALL_SIZE = 1800   # Стенка кита
+QTY_USDC = 1       # Твои 5 USDC
+WALL_SIZE = 500   # Стенка кита
 AGGREGATION = 0.05 
 PROFIT_TO_UNLOCK = 0.0030 # С нулевой комиссией можно раскрываться чуть раньше
 ACTIVATION_PNL = 0.0070   
