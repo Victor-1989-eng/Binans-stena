@@ -5,15 +5,15 @@ from binance.enums import *
 
 app = Flask(__name__)
 
-# --- НАСТРОЙКИ V14 ---
+# --- НАСТРОЙКИ V14.1 ---
 SYMBOL = 'BNBUSDT'
 LEVERAGE = 75
 QTY_USD = 1 
 WALL_SIZE = 900 
 AGGREGATION = 0.3
-PROFIT_TO_UNLOCK = 0.0030 # 0.3% для раскрытия замка
-ACTIVATION_PNL = 0.0070   # Активировать трейлинг при +0.7%
-CALLBACK_RATE = 0.0020    # Закрыть, если цена откатилась на 0.2% от пика
+PROFIT_TO_UNLOCK = 0.0030 
+ACTIVATION_PNL = 0.0070   
+CALLBACK_RATE = 0.0020    
 
 def get_binance_client():
     api_key = os.environ.get("BINANCE_API_KEY")
@@ -47,57 +47,54 @@ def run_bot():
                 side_to_close = 'SHORT' if pnl_l >= PROFIT_TO_UNLOCK else 'LONG'
                 survivor_side = 'LONG' if side_to_close == 'SHORT' else 'SHORT'
                 active_to_close = active_s if side_to_close == 'SHORT' else active_l
-                survivor_pos = active_l if survivor_side == 'LONG' else active_s
                 
-                # Закрываем убыточную ногу
+                # Пытаемся закрыть убыточную сторону
                 client.futures_create_order(symbol=SYMBOL, side=SIDE_BUY if side_to_close == 'SHORT' else SIDE_SELL, 
                                             positionSide=side_to_close, type=ORDER_TYPE_MARKET, quantity=abs(float(active_to_close['positionAmt'])))
-                
-                # Ставим БЕЗУБЫТОК сразу на биржу
-                entry_p = float(survivor_pos['entryPrice'])
-                client.futures_create_order(symbol=SYMBOL, side=SIDE_SELL if survivor_side == 'LONG' else SIDE_BUY, 
-                                            positionSide=survivor_side, type=ORDER_TYPE_STOP_MARKET, stopPrice=str(round(entry_p, 2)), closePosition=True)
-                
-                send_tg(f"🔓 *РАЗБЛОКИРОВКА:* Оставил {survivor_side}. Стоп в БЕЗУБЫТКЕ. Включаю трейлинг-слежку.")
-                return "Unlocked"
+                send_tg(f"🔓 Раскрыл замок. Оставил {survivor_side}. Ставлю защиту...")
+                return "Unlocking..."
 
-        # 2. ТРЕЙЛИНГ-СОПРОВОЖДЕНИЕ (Когда осталась одна позиция)
-        if active_l or active_s:
+        # 2. ПРОВЕРКА И ЗАЩИТА ОДИНОЧНОЙ ПОЗИЦИИ (Если замок уже раскрыт)
+        if (active_l or active_s) and not (active_l and active_s):
             side = 'LONG' if active_l else 'SHORT'
             pos = active_l if active_l else active_s
-            entry = float(pos['entryPrice'])
-            pnl = (curr_p - entry) / entry if side == 'LONG' else (entry - curr_p) / entry
+            entry_p = float(pos['entryPrice'])
             
-            # Если цена дошла до зоны активации трейлинга
+            # Проверяем, есть ли уже открытые ордера (Стоп/Тейк)
+            open_orders = client.futures_get_open_orders(symbol=SYMBOL)
+            if not open_orders:
+                # Если ордеров нет — СТАВИМ БЕЗУБЫТОК
+                client.futures_create_order(symbol=SYMBOL, side=SIDE_SELL if side == 'LONG' else SIDE_BUY, 
+                                            positionSide=side, type=ORDER_TYPE_STOP_MARKET, stopPrice=str(round(entry_p, 2)), closePosition=True)
+                send_tg(f"🛡 Обнаружил {side} без защиты. Выставил Стоп в безубыток.")
+            
+            # Логика трейлинга (если цена уже ушла далеко)
+            pnl = (curr_p - entry_p) / entry_p if side == 'LONG' else (entry_p - curr_p) / entry_p
             if pnl >= ACTIVATION_PNL:
-                # Рассчитываем динамический стоп (откат 0.2% от текущей цены)
-                # Для лонга стоп подтягиваем вверх, для шорта — вниз
                 new_sl = curr_p * (1 - CALLBACK_RATE) if side == 'LONG' else curr_p * (1 + CALLBACK_RATE)
-                
-                # Обновляем стоп-ордер на бирже (удаляем старый безубыток и ставим новый трейлинг)
                 client.futures_cancel_all_open_orders(symbol=SYMBOL)
                 client.futures_create_order(symbol=SYMBOL, side=SIDE_SELL if side == 'LONG' else SIDE_BUY, 
                                             positionSide=side, type=ORDER_TYPE_STOP_MARKET, stopPrice=str(round(new_sl, 2)), closePosition=True)
-                
-                return f"Трейлинг активен: {side} PNL {pnl*100:.2f}% | SL: {new_sl}"
-
-            return f"Сопровождаю {side}. PNL: {pnl*100:.2f}%"
+                return f"Trailing {side} at {pnl*100:.2f}%"
 
         # 3. ВХОД В ЗАМОК
-        depth = client.futures_order_book(symbol=SYMBOL, limit=100)
-        bid_p, _ = find_whale_walls(depth['bids'])
-        ask_p, _ = find_whale_walls(depth['asks'])
+        if not active_l and not active_s:
+            depth = client.futures_order_book(symbol=SYMBOL, limit=100)
+            bid_p, _ = find_whale_walls(depth['bids'])
+            ask_p, _ = find_whale_walls(depth['asks'])
+            if (bid_p and curr_p <= bid_p + 0.35) or (ask_p and curr_p >= ask_p - 0.35):
+                qty = round((QTY_USD * LEVERAGE) / curr_p, 2)
+                client.futures_create_order(symbol=SYMBOL, side=SIDE_BUY, positionSide='LONG', type=ORDER_TYPE_MARKET, quantity=qty)
+                client.futures_create_order(symbol=SYMBOL, side=SIDE_SELL, positionSide='SHORT', type=ORDER_TYPE_MARKET, quantity=qty)
+                send_tg(f"🔒 Вход в замок по {curr_p}")
+                return "Hedge Entry"
 
-        if (bid_p and curr_p <= bid_p + 0.35) or (ask_p and curr_p >= ask_p - 0.35):
-            qty = round((QTY_USD * LEVERAGE) / curr_p, 2)
-            client.futures_create_order(symbol=SYMBOL, side=SIDE_BUY, positionSide='LONG', type=ORDER_TYPE_MARKET, quantity=qty)
-            client.futures_create_order(symbol=SYMBOL, side=SIDE_SELL, positionSide='SHORT', type=ORDER_TYPE_MARKET, quantity=qty)
-            send_tg(f"🔒 *ЗАМОК* по {curr_p}. Жду импульс для трейлинга.")
-            return "Hedge Entry"
-
-        return f"Поиск стен... BNB: {curr_p}"
+        return f"Мониторинг. Цена: {curr_p}"
         
-    except Exception as e: return f"Ошибка: {e}", 400
+    except Exception as e:
+        # Если случилась любая ошибка - бот пришлет её в телеграм, чтобы мы знали
+        send_tg(f"⚠️ Ошибка в работе: {str(e)}")
+        return f"Error: {e}", 400
 
 def find_whale_walls(data):
     for p, q in data:
