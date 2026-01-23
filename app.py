@@ -11,8 +11,8 @@ SYMBOLS_CONFIG = {
     'ETHUSDT': {'wall': 400, 'prec': 2},
     'SOLUSDT': {'wall': 2500, 'prec': 2}
 }
-LEVERAGE = 50
-QTY_USD = 1 
+LEVERAGE = 20
+QTY_USD = 2 
 PROFIT_TO_UNLOCK = 0.0030 
 ACTIVATION_PNL = 0.0075   # Чуть поднял для мульти-актива
 CALLBACK_RATE = 0.0025    # Откат для фиксации
