@@ -5,16 +5,20 @@ from binance.enums import *
 
 app = Flask(__name__)
 
-# --- НАСТРОЙКИ V14.5 (С ФИЛЬТРОМ ОБЪЕМА) ---
+# --- НАСТРОЙКИ ZEC "ОХОТА ЗА ИКСАМИ" ---
 SYMBOL = 'ZECUSDC'
 LEVERAGE = 20
-QTY_USDC = 1       
-WALL_SIZE = 1000   
-AGGREGATION_RANGE = 0.20 
-MIN_5M_VOLUME = 1000  # Минимум 1500 ZEC должно проторговаться за 5 минут для входа
-PROFIT_TO_UNLOCK = 0.0025 
-ACTIVATION_PNL = 0.065   
-CALLBACK_RATE = 0.025    
+QTY_ZEC = 1.0       # Объем в монетах ZEC
+WALL_SIZE = 500     # Суммарный объем стен
+AGGREGATION = 0.25  # Диапазон суммирования цен (центы)
+MIN_5M_VOLUME = 250 # Фильтр активности (ZEC за 5 мин)
+
+# ПАРАМЕТРЫ ПРОФИТА
+BE_LEVEL = 0.010    # Безубыток на +1%
+TP_LEVEL = 0.035    # Тейк-профит +3.5%
+SL_LEVEL = 0.015    # Стоп-лосс -1.5%
+
+STATS_FILE = "stats_zec.txt"
 
 def get_binance_client():
     api_key = os.environ.get("BINANCE_API_KEY")
@@ -29,71 +33,94 @@ def send_tg(text):
         try: requests.post(url, json={"chat_id": chat_id, "text": text, "parse_mode": "Markdown"})
         except: pass
 
-def check_volume(client):
-    """Проверяет объем торгов за последние 5 минут"""
-    klines = client.futures_klines(symbol=SYMBOL, interval=KLINE_INTERVAL_1MINUTE, limit=5)
-    total_vol = sum(float(k[5]) for k in klines) # Суммируем Volume
-    return total_vol
+def get_5m_volume(client):
+    try:
+        klines = client.futures_klines(symbol=SYMBOL, interval='5m', limit=1)
+        return float(klines[0][5]) # Объем (Volume) за последнюю свечу
+    except: return 0
 
-def find_best_wall(data, range_val, target_vol):
-    best_price, max_vol = None, 0
-    for i in range(len(data)):
-        price = float(data[i][0])
-        current_sum = sum(float(item[1]) for item in data if abs(float(item[0]) - price) <= range_val)
-        if current_sum > max_vol:
-            max_vol, best_price = current_sum, price
-    return best_price, max_vol if max_vol >= target_vol else (None, 0)
+def find_whale_walls(data):
+    for p, q in data:
+        p_val = float(p)
+        # Суммируем плотность в диапазоне AGGREGATION
+        vol = sum([float(raw_q) for raw_p, raw_q in data if abs(float(raw_p) - p_val) <= AGGREGATION])
+        if vol >= WALL_SIZE: return p_val, vol
+    return None, 0
+
+def open_trade(client, side, price):
+    try:
+        client.futures_change_leverage(symbol=SYMBOL, leverage=LEVERAGE)
+        
+        order_side, close_side = ('BUY', 'SELL') if side == "LONG" else ('SELL', 'BUY')
+        
+        # Для ZEC округление до 2 знаков для цены и 3 для количества
+        price = round(price, 2)
+        
+        client.futures_create_order(symbol=SYMBOL, side=order_side, type='MARKET', quantity=QTY_ZEC)
+        
+        stop_p = round(price * (1 - SL_LEVEL) if side == "LONG" else price * (1 + SL_LEVEL), 2)
+        take_p = round(price * (1 + TP_LEVEL) if side == "LONG" else price * (1 - TP_LEVEL), 2)
+        
+        # Выставляем стоп и тейк
+        client.futures_create_order(symbol=SYMBOL, side=close_side, type='STOP_MARKET', stopPrice=str(stop_p), closePosition=True)
+        client.futures_create_order(symbol=SYMBOL, side=close_side, type='LIMIT', timeInForce='GTC', price=str(take_p), quantity=QTY_ZEC, reduceOnly=True)
+        
+        send_tg(f"🐺 *ZEC ВХОД {side}* по `{price}`\n🎯 Цель: `{take_p}` | 🛡 Стоп: `{stop_p}`")
+    except Exception as e:
+        send_tg(f"❌ Ошибка открытия ZEC: {e}")
 
 @app.route('/')
 def run_bot():
     client = get_binance_client()
     if not client: return "API Keys Missing", 500
     try:
-        # 0. ПРОВЕРКА ОБЪЕМА (ДЛЯ НОВЫХ СДЕЛОК)
-        vol_5m = check_volume(client)
+        pos = client.futures_position_information(symbol=SYMBOL)
+        active_pos = [p for p in pos if float(p['positionAmt']) != 0]
         
-        pos_info = client.futures_position_information(symbol=SYMBOL)
-        active_l = next((p for p in pos_info if p['positionSide'] == 'LONG' and float(p['positionAmt']) != 0), None)
-        active_s = next((p for p in pos_info if p['positionSide'] == 'SHORT' and float(p['positionAmt']) != 0), None)
-        curr_p = float(client.futures_symbol_ticker(symbol=SYMBOL)['price'])
-
-        # 1. РАЗБЛОКИРОВКА (всегда работает)
-        if active_l and active_s:
-            pnl_l = (curr_p - float(active_l['entryPrice'])) / float(active_l['entryPrice'])
-            pnl_s = (float(active_s['entryPrice']) - curr_p) / float(active_s['entryPrice'])
-            if pnl_l >= PROFIT_TO_UNLOCK or pnl_s >= PROFIT_TO_UNLOCK:
-                side_to_close = 'SHORT' if pnl_l >= PROFIT_TO_UNLOCK else 'LONG'
-                act_close = active_s if side_to_close == 'SHORT' else active_l
-                client.futures_create_order(symbol=SYMBOL, side=SIDE_BUY if side_to_close == 'SHORT' else SIDE_SELL, 
-                                            positionSide=side_to_close, type=ORDER_TYPE_MARKET, quantity=abs(float(act_close['positionAmt'])))
-                send_tg(f"🔓 *ZEC*: Раскрыл замок. Оставил тренд.")
-                return "Unlocked"
-
-        # 2. ТРЕЙЛИНГ (всегда работает)
-        if (active_l or active_s) and not (active_l and active_s):
-            # ... (логика трейлинга остается прежней)
-            # [Для краткости оставим её внутри твоего кода]
-            pass
-
-        # 3. ВХОД (ТОЛЬКО ЕСЛИ ОБЪЕМ ВЫШЕ MIN_5M_VOLUME)
-        if not active_l and not active_s:
-            if vol_5m < MIN_5M_VOLUME:
-                return f"Wait. Low Volume: {round(vol_5m)} ZEC/5m", 200
+        if active_pos:
+            p = active_pos[0]
+            amt = float(p['positionAmt'])
+            entry_p = float(p['entryPrice'])
+            curr_p = float(client.futures_symbol_ticker(symbol=SYMBOL)['price'])
             
-            depth = client.futures_order_book(symbol=SYMBOL, limit=50)
-            bid_p, bid_v = find_best_wall(depth['bids'], AGGREGATION_RANGE, WALL_SIZE)
-            ask_p, ask_v = find_best_wall(depth['asks'], AGGREGATION_RANGE, WALL_SIZE)
+            pnl_pct = (curr_p - entry_p) / entry_p if amt > 0 else (entry_p - curr_p) / entry_p
+            
+            # Логика безубытка
+            if pnl_pct >= BE_LEVEL:
+                orders = client.futures_get_open_orders(symbol=SYMBOL)
+                for o in orders:
+                    if o['type'] == 'STOP_MARKET' and float(o['stopPrice']) != entry_p:
+                        client.futures_cancel_order(symbol=SYMBOL, orderId=o['orderId'])
+                        side = 'SELL' if amt > 0 else 'BUY'
+                        client.futures_create_order(symbol=SYMBOL, side=side, type='STOP_MARKET', stopPrice=str(round(entry_p, 2)), closePosition=True)
+                        send_tg("🛡 ZEC: Стоп перенесен в БЕЗУБЫТОК")
+            
+            return f"ZEC в сделке. Профит: {pnl_pct*100:.2f}%"
 
-            if (bid_p and curr_p <= bid_p + 0.15) or (ask_p and curr_p >= ask_p - 0.15):
-                qty = round((QTY_USDC * LEVERAGE) / curr_p, 3)
-                client.futures_create_order(symbol=SYMBOL, side=SIDE_BUY, positionSide='LONG', type=ORDER_TYPE_MARKET, quantity=qty)
-                client.futures_create_order(symbol=SYMBOL, side=SIDE_SELL, positionSide='SHORT', type=ORDER_TYPE_MARKET, quantity=qty)
-                send_tg(f"🔒 *ZEC*: Замок! Объем рынка: {round(vol_5m)} ZEC/5m")
-                return "Hedge Entry"
+        # Если позиции нет — ищем вход
+        vol_5m = get_5m_volume(client)
+        if vol_5m < MIN_5M_VOLUME:
+            return f"Рынок спит. Объем 5м: {vol_5m:.1f} (нужно {MIN_5M_VOLUME})"
 
-        return f"Scan. Vol: {round(vol_5m)}. Price: {curr_p}"
+        depth = client.futures_order_book(symbol=SYMBOL, limit=100)
+        curr_p = float(client.futures_symbol_ticker(symbol=SYMBOL)['price'])
+        
+        bid_p, bid_v = find_whale_walls(depth['bids'])
+        ask_p, ask_v = find_whale_walls(depth['asks'])
+
+        # Вход от нижней стены (Long)
+        if bid_p and curr_p <= bid_p + 0.10:
+            open_trade(client, "LONG", curr_p)
+            return "Открываю LONG по ZEC"
+            
+        # Вход от верхней стены (Short)
+        if ask_p and curr_p >= ask_p - 0.10:
+            open_trade(client, "SHORT", curr_p)
+            return "Открываю SHORT по ZEC"
+
+        return f"ZEC Сканирую... Объем 5м: {vol_5m:.1f}. Стен > {WALL_SIZE} нет."
     except Exception as e:
-        return f"Error: {e}", 400
+        return f"Ошибка ZEC: {e}", 400
 
 if __name__ == "__main__":
     app.run(host='0.0.0.0', port=10000)
