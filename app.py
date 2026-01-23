@@ -5,15 +5,17 @@ from binance.enums import *
 
 app = Flask(__name__)
 
-# --- НАСТРОЙКИ V14.1 ---
-SYMBOL = 'BNBUSDT'
-LEVERAGE = 75
+# --- НАСТРОЙКИ МУЛЬТИ-БОТА ---
+SYMBOLS_CONFIG = {
+    'BNBUSDT': {'wall': 750, 'prec': 2},
+    'ETHUSDT': {'wall': 400, 'prec': 2},
+    'SOLUSDT': {'wall': 2500, 'prec': 2}
+}
+LEVERAGE = 50
 QTY_USD = 1 
-WALL_SIZE = 900 
-AGGREGATION = 0.3
 PROFIT_TO_UNLOCK = 0.0030 
-ACTIVATION_PNL = 0.0070   
-CALLBACK_RATE = 0.0020    
+ACTIVATION_PNL = 0.0075   # Чуть поднял для мульти-актива
+CALLBACK_RATE = 0.0025    # Откат для фиксации
 
 def get_binance_client():
     api_key = os.environ.get("BINANCE_API_KEY")
@@ -32,76 +34,64 @@ def send_tg(text):
 def run_bot():
     client = get_binance_client()
     if not client: return "API Keys Missing", 500
+    
     try:
-        pos_info = client.futures_position_information(symbol=SYMBOL)
-        active_l = next((p for p in pos_info if p['positionSide'] == 'LONG' and float(p['positionAmt']) != 0), None)
-        active_s = next((p for p in pos_info if p['positionSide'] == 'SHORT' and float(p['positionAmt']) != 0), None)
-        curr_p = float(client.futures_symbol_ticker(symbol=SYMBOL)['price'])
+        for symbol, config in SYMBOLS_CONFIG.items():
+            pos_info = client.futures_position_information(symbol=symbol)
+            active_l = next((p for p in pos_info if p['positionSide'] == 'LONG' and float(p['positionAmt']) != 0), None)
+            active_s = next((p for p in pos_info if p['positionSide'] == 'SHORT' and float(p['positionAmt']) != 0), None)
+            curr_p = float(client.futures_symbol_ticker(symbol=symbol)['price'])
 
-        # 1. ЛОГИКА РАЗБЛОКИРОВКИ
-        if active_l and active_s:
-            pnl_l = (curr_p - float(active_l['entryPrice'])) / float(active_l['entryPrice'])
-            pnl_s = (float(active_s['entryPrice']) - curr_p) / float(active_s['entryPrice'])
+            # 1. РАЗБЛОКИРОВКА ЗАМКА
+            if active_l and active_s:
+                p_l = (curr_p - float(active_l['entryPrice'])) / float(active_l['entryPrice'])
+                p_s = (float(active_s['entryPrice']) - curr_p) / float(active_s['entryPrice'])
 
-            if pnl_l >= PROFIT_TO_UNLOCK or pnl_s >= PROFIT_TO_UNLOCK:
-                side_to_close = 'SHORT' if pnl_l >= PROFIT_TO_UNLOCK else 'LONG'
-                survivor_side = 'LONG' if side_to_close == 'SHORT' else 'SHORT'
-                active_to_close = active_s if side_to_close == 'SHORT' else active_l
+                if p_l >= PROFIT_TO_UNLOCK or p_s >= PROFIT_TO_UNLOCK:
+                    side_to_close = 'SHORT' if p_l >= PROFIT_TO_UNLOCK else 'LONG'
+                    survivor = 'LONG' if side_to_close == 'SHORT' else 'SHORT'
+                    act_close = active_s if side_to_close == 'SHORT' else active_l
+                    
+                    client.futures_create_order(symbol=symbol, side=SIDE_BUY if side_to_close == 'SHORT' else SIDE_SELL, 
+                                                positionSide=side_to_close, type=ORDER_TYPE_MARKET, quantity=abs(float(act_close['positionAmt'])))
+                    send_tg(f"🔓 *{symbol}*: Замок раскрыт! Оставил {survivor}.")
+                continue
+
+            # 2. ТРЕЙЛИНГ И ЗАЩИТА
+            if (active_l or active_s) and not (active_l and active_s):
+                side = 'LONG' if active_l else 'SHORT'
+                pos = active_l if active_l else active_s
+                entry_p = float(pos['entryPrice'])
+                pnl = (curr_p - entry_p) / entry_p if side == 'LONG' else (entry_p - curr_p) / entry_p
                 
-                # Пытаемся закрыть убыточную сторону
-                client.futures_create_order(symbol=SYMBOL, side=SIDE_BUY if side_to_close == 'SHORT' else SIDE_SELL, 
-                                            positionSide=side_to_close, type=ORDER_TYPE_MARKET, quantity=abs(float(active_to_close['positionAmt'])))
-                send_tg(f"🔓 Раскрыл замок. Оставил {survivor_side}. Ставлю защиту...")
-                return "Unlocking..."
+                orders = client.futures_get_open_orders(symbol=symbol)
+                if not orders:
+                    client.futures_create_order(symbol=symbol, side=SIDE_SELL if side == 'LONG' else SIDE_BUY, 
+                                                positionSide=side, type=ORDER_TYPE_STOP_MARKET, stopPrice=str(round(entry_p, 2)), closePosition=True)
+                
+                if pnl >= ACTIVATION_PNL:
+                    new_sl = curr_p * (1 - CALLBACK_RATE) if side == 'LONG' else curr_p * (1 + CALLBACK_RATE)
+                    client.futures_cancel_all_open_orders(symbol=symbol)
+                    client.futures_create_order(symbol=symbol, side=SIDE_SELL if side == 'LONG' else SIDE_BUY, 
+                                                positionSide=side, type=ORDER_TYPE_STOP_MARKET, stopPrice=str(round(new_sl, 2)), closePosition=True)
+                continue
 
-        # 2. ПРОВЕРКА И ЗАЩИТА ОДИНОЧНОЙ ПОЗИЦИИ (Если замок уже раскрыт)
-        if (active_l or active_s) and not (active_l and active_s):
-            side = 'LONG' if active_l else 'SHORT'
-            pos = active_l if active_l else active_s
-            entry_p = float(pos['entryPrice'])
-            
-            # Проверяем, есть ли уже открытые ордера (Стоп/Тейк)
-            open_orders = client.futures_get_open_orders(symbol=SYMBOL)
-            if not open_orders:
-                # Если ордеров нет — СТАВИМ БЕЗУБЫТОК
-                client.futures_create_order(symbol=SYMBOL, side=SIDE_SELL if side == 'LONG' else SIDE_BUY, 
-                                            positionSide=side, type=ORDER_TYPE_STOP_MARKET, stopPrice=str(round(entry_p, 2)), closePosition=True)
-                send_tg(f"🛡 Обнаружил {side} без защиты. Выставил Стоп в безубыток.")
-            
-            # Логика трейлинга (если цена уже ушла далеко)
-            pnl = (curr_p - entry_p) / entry_p if side == 'LONG' else (entry_p - curr_p) / entry_p
-            if pnl >= ACTIVATION_PNL:
-                new_sl = curr_p * (1 - CALLBACK_RATE) if side == 'LONG' else curr_p * (1 + CALLBACK_RATE)
-                client.futures_cancel_all_open_orders(symbol=SYMBOL)
-                client.futures_create_order(symbol=SYMBOL, side=SIDE_SELL if side == 'LONG' else SIDE_BUY, 
-                                            positionSide=side, type=ORDER_TYPE_STOP_MARKET, stopPrice=str(round(new_sl, 2)), closePosition=True)
-                return f"Trailing {side} at {pnl*100:.2f}%"
+            # 3. ПОИСК НОВЫХ ВХОДОВ
+            depth = client.futures_order_book(symbol=symbol, limit=20)
+            # Ищем стенку в стакане
+            bid = next((float(p) for p, q in depth['bids'] if float(q) >= config['wall']), None)
+            ask = next((float(p) for p, q in depth['asks'] if float(q) >= config['wall']), None)
 
-        # 3. ВХОД В ЗАМОК
-        if not active_l and not active_s:
-            depth = client.futures_order_book(symbol=SYMBOL, limit=100)
-            bid_p, _ = find_whale_walls(depth['bids'])
-            ask_p, _ = find_whale_walls(depth['asks'])
-            if (bid_p and curr_p <= bid_p + 0.35) or (ask_p and curr_p >= ask_p - 0.35):
-                qty = round((QTY_USD * LEVERAGE) / curr_p, 2)
-                client.futures_create_order(symbol=SYMBOL, side=SIDE_BUY, positionSide='LONG', type=ORDER_TYPE_MARKET, quantity=qty)
-                client.futures_create_order(symbol=SYMBOL, side=SIDE_SELL, positionSide='SHORT', type=ORDER_TYPE_MARKET, quantity=qty)
-                send_tg(f"🔒 Вход в замок по {curr_p}")
-                return "Hedge Entry"
-
-        return f"Мониторинг. Цена: {curr_p}"
+            if (bid and curr_p <= bid * 1.0005) or (ask and curr_p >= ask * 0.9995):
+                qty = round((QTY_USD * LEVERAGE) / curr_p, config['prec'])
+                client.futures_create_order(symbol=symbol, side=SIDE_BUY, positionSide='LONG', type=ORDER_TYPE_MARKET, quantity=qty)
+                client.futures_create_order(symbol=symbol, side=SIDE_SELL, positionSide='SHORT', type=ORDER_TYPE_MARKET, quantity=qty)
+                send_tg(f"🔒 *{symbol}*: Вход в замок от стены кита!")
         
+        return "Multi-Scan OK"
     except Exception as e:
-        # Если случилась любая ошибка - бот пришлет её в телеграм, чтобы мы знали
-        send_tg(f"⚠️ Ошибка в работе: {str(e)}")
+        send_tg(f"⚠️ Ошибка мульти-бота: {str(e)}")
         return f"Error: {e}", 400
-
-def find_whale_walls(data):
-    for p, q in data:
-        p_val = float(p)
-        vol = sum([float(raw_q) for raw_p, raw_q in data if abs(float(raw_p) - p_val) <= AGGREGATION])
-        if vol >= WALL_SIZE: return p_val, vol
-    return None, 0
 
 if __name__ == "__main__":
     app.run(host='0.0.0.0', port=10000)
