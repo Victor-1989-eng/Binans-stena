@@ -8,8 +8,8 @@ app = Flask(__name__)
 # --- НАСТРОЙКИ V14.5 (С ФИЛЬТРОМ ОБЪЕМА) ---
 SYMBOL = 'ZECUSDC'
 LEVERAGE = 20
-QTY_USDC = 5       
-WALL_SIZE = 1000   
+QTY_USDC = 1       
+WALL_SIZE = 500   
 AGGREGATION_RANGE = 0.20 
 MIN_5M_VOLUME = 1500  # Минимум 1500 ZEC должно проторговаться за 5 минут для входа
 PROFIT_TO_UNLOCK = 0.0025 
