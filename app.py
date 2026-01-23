@@ -9,12 +9,12 @@ app = Flask(__name__)
 SYMBOL = 'ZECUSDC'
 LEVERAGE = 20
 QTY_USDC = 1       
-WALL_SIZE = 500   
-AGGREGATION_RANGE = 0.50 
-MIN_5M_VOLUME = 500  # Минимум 1500 ZEC должно проторговаться за 5 минут для входа
+WALL_SIZE = 1000   
+AGGREGATION_RANGE = 0.20 
+MIN_5M_VOLUME = 1000  # Минимум 1500 ZEC должно проторговаться за 5 минут для входа
 PROFIT_TO_UNLOCK = 0.0025 
-ACTIVATION_PNL = 0.0065   
-CALLBACK_RATE = 0.0025    
+ACTIVATION_PNL = 0.065   
+CALLBACK_RATE = 0.025    
 
 def get_binance_client():
     api_key = os.environ.get("BINANCE_API_KEY")
