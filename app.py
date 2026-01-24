@@ -8,7 +8,7 @@ app = Flask(__name__)
 # --- НАСТРОЙКИ СИСТЕМЫ "SMART MEMORY" ---
 SYMBOL = 'ZECUSDC'
 LEVERAGE = 20
-QTY_ZEC = 1.3
+QTY_ZEC = 0.5
 
 # Параметры целей (твои 10.5% и ступенчатый стоп)
 TP_LEVEL = 0.105
