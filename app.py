@@ -1,31 +1,33 @@
 import os, requests, time
 from flask import Flask
 from binance.client import Client
-from binance.enums import *
 
 app = Flask(__name__)
 
-# ==========================================
-# --- НАСТРОЙКИ РЕЖИМА (МЕНЯТЬ ТУТ) ---
-MODE = "PAPER"        # "PAPER" - понарошку, "REAL" - по-настоящему
-DOLLAR_AMOUNT = 6.0   # Виртуальная или реальная сумма входа (в USDC)
-# ==========================================
+# --- ГЛОБАЛЬНЫЕ НАСТРОЙКИ ---
+MODE = "PAPER" 
+DOLLAR_PER_TRADE = 5.0 # Сумма на одну монету
 
-SYMBOL = 'ZECUSDC'
-LEVERAGE = 20
-TP_LEVEL = 0.105      # Цель 10.5%
-SL_LEVEL = 0.020      # Стоп 2.0%
-TRAIL_STEP = 0.010    # Шаг трейлинга 1%
-STATS_FILE = "stats_demo.txt"
+# Независимая корзина (3 Long / 3 Short)
+BASKET_CONFIG = [
+    {'symbol': 'BTCUSDC', 'side': 'LONG'},
+    {'symbol': 'ETHUSDC', 'side': 'SHORT'},
+    {'symbol': 'ZECUSDC', 'side': 'LONG'},
+    {'symbol': 'SOLUSDC', 'side': 'SHORT'},
+    {'symbol': 'LINKUSDC', 'side': 'LONG'},
+    {'symbol': 'XRPUSDC', 'side': 'SHORT'}
+]
 
-# Глобальная переменная для хранения виртуальной позиции (в памяти)
-# Формат: {'side': 'LONG', 'entry': 370.5, 'stop': 365.0, 'take': 410.0, 'qty': 0.1}
-virtual_pos = None 
+# Математика 1 к 3
+START_SL = 0.035     # Стоп 3.5%
+FINAL_TP = 0.105     # Тейк 10.5%
+TRAIL_STEP = 0.030   # Шаг трейлинга 3%
 
-def get_binance_client():
-    api_key = os.environ.get("BINANCE_API_KEY")
-    api_secret = os.environ.get("BINANCE_API_SECRET")
-    return Client(api_key, api_secret) if api_key and api_secret else None
+# Память бота (не сбрасывается между вызовами Flask в рамках одной сессии)
+if 'active_trades' not in globals():
+    active_trades = {}
+if 'cycle_count' not in globals():
+    cycle_count = 0
 
 def send_tg(text):
     token = os.environ.get("TELEGRAM_TOKEN")
@@ -35,109 +37,69 @@ def send_tg(text):
         try: requests.post(url, json={"chat_id": chat_id, "text": text, "parse_mode": "Markdown"})
         except: pass
 
-def get_market_data(client):
-    try:
-        klines = client.futures_klines(symbol=SYMBOL, interval='5m', limit=12)
-        avg_vol = sum(float(k[5]) for k in klines) / 12
-        curr_vol = float(klines[-1][5])
-        depth = client.futures_order_book(symbol=SYMBOL, limit=50)
-        all_q = [float(q) for p, q in depth['bids']] + [float(q) for p, q in depth['asks']]
-        dynamic_wall = (sum(all_q) / len(all_q)) * 3.5
-        dynamic_wall = max(120, min(700, dynamic_wall))
-        return curr_vol, dynamic_wall, avg_vol, depth
-    except: return 0, 200, 0, None
-
-def open_trade(client, side, price):
-    global virtual_pos
-    curr_p = float(client.futures_symbol_ticker(symbol=SYMBOL)['price'])
-    qty = round(DOLLAR_AMOUNT / curr_p, 1)
-    if qty < 0.1: qty = 0.1
-    
-    stop_p = round(curr_p * (1 - SL_LEVEL) if side == "LONG" else curr_p * (1 + SL_LEVEL), 2)
-    take_p = round(curr_p * (1 + TP_LEVEL) if side == "LONG" else curr_p * (1 - TP_LEVEL), 2)
-
-    if MODE == "PAPER":
-        virtual_pos = {
-            'side': side, 'entry': curr_p, 'stop': stop_p, 
-            'take': take_p, 'qty': qty, 'max_pnl': 0
-        }
-        send_tg(f"🧪 *ДЕМО-ВХОД {side}*\nЦена: `{curr_p}`\nСумма: `${DOLLAR_AMOUNT}`\nЦель: `{take_p}`")
-    else:
-        try:
-            client.futures_change_position_mode(dualSidePosition=False)
-            client.futures_change_margin_type(symbol=SYMBOL, marginType='ISOLATED')
-            client.futures_change_leverage(symbol=SYMBOL, leverage=LEVERAGE)
-            order_side, close_side = ('BUY', 'SELL') if side == "LONG" else ('SELL', 'BUY')
-            client.futures_create_order(symbol=SYMBOL, side=order_side, type='MARKET', quantity=qty)
-            client.futures_create_order(symbol=SYMBOL, side=close_side, type='STOP_MARKET', stopPrice=str(stop_p), closePosition=True)
-            client.futures_create_order(symbol=SYMBOL, side=close_side, type='LIMIT', timeInForce='GTC', price=str(take_p), quantity=qty, reduceOnly=True)
-            send_tg(f"🚀 *РЕАЛЬНЫЙ ВХОД {side}*\nЦена: `{curr_p}`\nЦель: `{take_p}`")
-        except Exception as e:
-            send_tg(f"❌ Ошибка входа: {e}")
-
 @app.route('/')
-def run_bot():
-    global virtual_pos
-    client = get_binance_client()
-    if not client: return "No API", 500
+def run_conveyor():
+    global active_trades, cycle_count
+    client = Client(os.environ.get("BINANCE_API_KEY"), os.environ.get("BINANCE_API_SECRET"))
     
-    try:
-        curr_p = float(client.futures_symbol_ticker(symbol=SYMBOL)['price'])
+    # 1. ПРОВЕРКА: Ждем ли мы завершения старого цикла?
+    if active_trades:
+        symbols_to_remove = []
+        for sym, trade in active_trades.items():
+            try:
+                curr_p = float(client.futures_symbol_ticker(symbol=sym)['price'])
+                is_long = trade['side'] == "LONG"
+                pnl = (curr_p - trade['entry'])/trade['entry'] if is_long else (trade['entry'] - curr_p)/trade['entry']
+                
+                # Условия выхода
+                hit_tp = (curr_p >= trade['take']) if is_long else (curr_p <= trade['take'])
+                hit_sl = (curr_p <= trade['stop']) if is_long else (curr_p >= trade['stop'])
+                
+                if hit_tp or hit_sl:
+                    status = "✅ ТЕЙК" if hit_tp else "🍎 СТОП"
+                    send_tg(f"{status} по {sym} ({trade['side']})\nPNL: `{pnl*100:.2f}%`")
+                    symbols_to_remove.append(sym)
+                else:
+                    # Логика скользящего стопа
+                    steps = int(pnl / TRAIL_STEP)
+                    if steps >= 1:
+                        new_stop_offset = (steps - 1) * TRAIL_STEP
+                        if steps == 1: new_stop_offset = 0.002 # Б/У
+                        new_stop = round(trade['entry'] * (1 + new_stop_offset) if is_long else trade['entry'] * (1 - new_stop_offset), 4)
+                        
+                        if (is_long and new_stop > trade['stop']) or (not is_long and new_stop < trade['stop']):
+                            trade['stop'] = new_stop
+                            send_tg(f"🛡 {sym}: Стоп подтянут в `{new_stop}`")
+            except: continue
 
-        # --- МОНИТОРИНГ ПОЗИЦИИ ---
-        if MODE == "PAPER" and virtual_pos:
-            side, entry = virtual_pos['side'], virtual_pos['entry']
-            pnl_pct = (curr_p - entry)/entry if side == "LONG" else (entry - curr_p)/entry
+        for sym in symbols_to_remove:
+            del active_trades[sym]
+
+        if not active_trades:
+            send_tg("🏁 *ЦИКЛ ЗАВЕРШЕН*. Все сделки закрыты. Жду 5 минут перед новым кругом...")
+            return "Цикл завершен. Очистка..."
+        
+        return f"В работе {len(active_trades)} сделок. Ждем завершения цикла."
+
+    # 2. ЗАПУСК НОВОГО ЦИКЛА
+    cycle_count += 1
+    send_tg(f"🌀 *ЗАПУСК ЦИКЛА №{cycle_count}*")
+    
+    for config in BASKET_CONFIG:
+        sym = config['symbol']
+        try:
+            curr_p = float(client.futures_symbol_ticker(symbol=sym)['price'])
+            side = config['side']
+            stop_p = round(curr_p * (1 - START_SL) if side == "LONG" else curr_p * (1 + START_SL), 4)
+            take_p = round(curr_p * (1 + FINAL_TP) if side == "LONG" else curr_p * (1 - FINAL_TP), 4)
             
-            # Проверка условий выхода (Стоп/Тейк)
-            if (side == "LONG" and curr_p <= virtual_pos['stop']) or (side == "SHORT" and curr_p >= virtual_pos['stop']):
-                send_tg(f"🍎 *ДЕМО: СТОП-ЛОСС* (PNL: `{pnl_pct*100:.2f}%`)")
-                virtual_pos = None
-            elif (side == "LONG" and curr_p >= virtual_pos['take']) or (side == "SHORT" and curr_p <= virtual_pos['take']):
-                send_tg(f"💰 *ДЕМО: ТЕЙК-ПРОФИТ!* (PNL: `{pnl_pct*100:.2f}%`)")
-                virtual_pos = None
-            else:
-                # Трейлинг-стоп (виртуальный)
-                steps = int(pnl_pct / TRAIL_STEP)
-                if steps >= 1:
-                    new_stop = round(entry * (1 + (steps-1)*TRAIL_STEP) if side == "LONG" else entry * (1 - (steps-1)*TRAIL_STEP), 2)
-                    if (side == "LONG" and new_stop > virtual_pos['stop']) or (side == "SHORT" and new_stop < virtual_pos['stop']):
-                        virtual_pos['stop'] = new_stop
-                        send_tg(f"🛡 *ДЕМО: Трейлинг* поднят до `{new_stop}`")
-            return f"ДЕМО: {side} PNL: {pnl_pct*100:.2f}%"
-
-        elif MODE == "REAL":
-            pos = client.futures_position_information(symbol=SYMBOL)
-            active = [p for p in pos if float(p['positionAmt']) != 0]
-            if active:
-                # Тут логика трейлинга для реальных ордеров (уже была в коде)
-                return "В реальной сделке..."
-
-        # --- ПОИСК ВХОДА (ОБЩИЙ ДЛЯ ОБОИХ РЕЖИМОВ) ---
-        curr_vol, wall_limit, avg_h_vol, depth = get_market_data(client)
-        if curr_vol < (avg_h_vol * 0.25):
-            return f"Сон (Vol: {curr_vol:.1f})"
-
-        def find_walls(data, limit):
-            for p, q in data:
-                vol = sum(float(rq) for rp, rq in data if abs(float(rp) - float(p)) <= 0.60)
-                if vol >= limit: return float(p), vol
-            return None, 0
-
-        bid_p, bid_v = find_walls(depth['bids'], wall_limit)
-        ask_p, ask_v = find_walls(depth['asks'], wall_limit)
-
-        if bid_p and curr_p <= bid_p + 0.40:
-            open_trade(client, "LONG", curr_p)
-            return "Вход в LONG"
-        if ask_p and curr_p >= ask_p - 0.40:
-            open_trade(client, "SHORT", curr_p)
-            return "Вход в SHORT"
-
-        return f"Поиск. Планка: {wall_limit:.0f} ZEC. Vol: {curr_vol:.1f}"
-
-    except Exception as e:
-        return f"Error: {e}", 400
+            active_trades[sym] = {
+                'side': side, 'entry': curr_p, 'stop': stop_p, 'take': take_p
+            }
+        except: continue
+    
+    send_tg(f"✅ Все 6 позиций открыты (PAPER). Поехали!")
+    return f"Цикл №{cycle_count} запущен."
 
 if __name__ == "__main__":
     app.run(host='0.0.0.0', port=10000)
