@@ -8,7 +8,7 @@ app = Flask(__name__)
 # --- НАСТРОЙКИ СИСТЕМЫ "SMART MEMORY" ---
 SYMBOL = 'ZECUSDC'
 LEVERAGE = 20
-QTY_ZEC = 0.5
+QTY_ZEC = 1.0
 
 # Параметры целей (твои 10.5% и ступенчатый стоп)
 TP_LEVEL = 0.105
@@ -51,18 +51,29 @@ def get_market_data(client):
 
 def open_trade(client, side, price):
     try:
+        # 1. Сбрасываем режим позиции и маржи
+        try: client.futures_change_position_mode(dualSidePosition=False)
+        except: pass
+        
+        try: client.futures_change_margin_type(symbol=SYMBOL, marginType='ISOLATED')
+        except: pass # Если уже изолированная, просто идем дальше
+
         client.futures_change_leverage(symbol=SYMBOL, leverage=LEVERAGE)
+        
         order_side, close_side = ('BUY', 'SELL') if side == "LONG" else ('SELL', 'BUY')
-        client.futures_create_order(symbol=SYMBOL, side=order_side, type='MARKET', quantity=QTY_ZEC)
+        
+        # 2. Входим (объем 1.0 для теста стабильности)
+        client.futures_create_order(symbol=SYMBOL, side=order_side, type='MARKET', quantity=1.0)
         
         price = round(price, 2)
         stop_p = round(price * (1 - SL_LEVEL) if side == "LONG" else price * (1 + SL_LEVEL), 2)
         take_p = round(price * (1 + TP_LEVEL) if side == "LONG" else price * (1 - TP_LEVEL), 2)
         
+        # 3. Выставляем защитные ордера
         client.futures_create_order(symbol=SYMBOL, side=close_side, type='STOP_MARKET', stopPrice=str(stop_p), closePosition=True)
-        client.futures_create_order(symbol=SYMBOL, side=close_side, type='LIMIT', timeInForce='GTC', price=str(take_p), quantity=QTY_ZEC, reduceOnly=True)
+        client.futures_create_order(symbol=SYMBOL, side=close_side, type='LIMIT', timeInForce='GTC', price=str(take_p), quantity=1.0, reduceOnly=True)
         
-        send_tg(f"🤖 *AUTO-ZEC: ВХОД {side}*\nПланка стен сегодня: `{price}`\nЦель 10.5%: `{take_p}`")
+        send_tg(f"✅ *УСПЕШНЫЙ ВХОД!* {side} по `{price}`\nЦель 10.5%: `{take_p}`\nМаржа под контролем.")
     except Exception as e:
         send_tg(f"❌ Ошибка входа: {e}")
 
