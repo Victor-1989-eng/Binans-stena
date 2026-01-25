@@ -8,7 +8,7 @@ app = Flask(__name__)
 
 # --- НАСТРОЙКИ ---
 SYMBOL = 'BNBUSDC'
-TRADE_AMOUNT_USDC = 4.0
+TRADE_AMOUNT_USDC = 5.0
 STEP = 2.0         # Расстояние до активации Замка
 PROFIT_GOAL = 4.0  # Твой тейк 4$
 LEVERAGE = 20
