@@ -1,27 +1,18 @@
-import os, requests, time
+import os, requests
 from flask import Flask
 from binance.client import Client
 
 app = Flask(__name__)
 
-# --- НАСТРОЙКИ КОНВЕЙЕРА (PAPER) ---
+# --- НАСТРОЙКИ ПОД ТВОЙ ВЗГЛЯД ---
 SYMBOL = 'BNBUSDC'
-WALL_SIZE = 900      # Плотность "Миллионер"
-RANGE_MAX = 0.015    # Макс. разброс между стенками
-AGGREGATION = 0.5    # Группировка стакана
+WALL_SIZE = 2000     # Ищем крупные блоки (как 3.2к и 2.3к)
+AGGREGATION = 10.0   # Группировка как у тебя на экране
+START_SL = 0.035     # Твой риск
+FINAL_TP = 0.105     # Твоя цель
 
-# --- НАША МАТЕМАТИКА 1 к 3 ---
-START_SL = 0.035     # 3.5%
-FINAL_TP = 0.105     # 10.5%
-BE_LEVEL = 0.035     # Перенос в Б/У при 3.5%
-
-# Память для бумажных сделок
 active_trades = {}
-
-def get_binance_client():
-    api_key = os.environ.get("BINANCE_API_KEY")
-    api_secret = os.environ.get("BINANCE_API_SECRET")
-    return Client(api_key, api_secret) if api_key and api_secret else None
+RETRY_COUNT = {} # Память для перезаходов
 
 def send_tg(text):
     token = os.environ.get("TELEGRAM_TOKEN")
@@ -31,85 +22,75 @@ def send_tg(text):
         try: requests.post(url, json={"chat_id": chat_id, "text": text, "parse_mode": "Markdown"})
         except: pass
 
-def find_whale_walls(data):
-    for p, q in data:
-        p_val = float(p)
-        vol = sum([float(raw_q) for raw_p, raw_q in data if abs(float(raw_p) - p_val) <= AGGREGATION])
-        if vol >= WALL_SIZE: return p_val, vol
-    return None, 0
-
 @app.route('/')
-def run_bot():
-    global active_trades
-    client = get_binance_client()
-    if not client: return "API Keys Missing", 500
+def run_logic():
+    global active_trades, RETRY_COUNT
+    api_key = os.environ.get("BINANCE_API_KEY")
+    api_secret = os.environ.get("BINANCE_API_SECRET")
+    client = Client(api_key, api_secret)
     
     try:
-        # 1. ПРОВЕРКА АКТИВНОЙ БУМАЖНОЙ СДЕЛКИ
+        curr_p = float(client.futures_symbol_ticker(symbol=SYMBOL)['price'])
+        
+        # 1. ПРОВЕРКА ТЕКУЩИХ СДЕЛОК
         if SYMBOL in active_trades:
             trade = active_trades[SYMBOL]
-            curr_p = float(client.futures_symbol_ticker(symbol=SYMBOL)['price'])
+            side = trade['side']
+            pnl = (curr_p - trade['entry']) / trade['entry'] if side == 'LONG' else (trade['entry'] - curr_p) / trade['entry']
             
-            # Считаем PNL
-            if trade['side'] == 'LONG':
-                pnl_pct = (curr_p - trade['entry']) / trade['entry']
-            else:
-                pnl_pct = (trade['entry'] - curr_p) / trade['entry']
-
-            # Логика БЕЗУБЫТКА
-            if pnl_pct >= BE_LEVEL and not trade['is_be']:
-                trade['stop'] = trade['entry']
-                trade['is_be'] = True
-                send_tg(f"🛡 *BNB*: Стоп перенесен в БЕЗУБЫТОК (+3.5% пройдены)")
-
-            # Закрытие по ТЕЙКУ
-            if pnl_pct >= FINAL_TP:
-                send_tg(f"✅ *ПРОФИТ BNB*: +10.5% 💰")
+            # ТЕЙК
+            if pnl >= FINAL_TP:
+                send_tg(f"💰 ТЕЙК-ПРОФИТ! {SYMBOL} {side} закрыт в +10.5%")
                 del active_trades[SYMBOL]
-                return "Take Profit hit"
+                return "Profit"
 
-            # Закрытие по СТОПУ
-            if (trade['side'] == 'LONG' and curr_p <= trade['stop']) or \
-               (trade['side'] == 'SHORT' and curr_p >= trade['stop']):
-                res = "0% (Б/У)" if trade['is_be'] else "-3.5%"
-                send_tg(f"❌ *СТОП BNB*: {res}")
-                del active_trades[SYMBOL]
-                return "Stop Loss hit"
-
-            return f"BNB в сделке. Текущий PNL: {pnl_pct*100:.2f}%"
-
-        # 2. ПОИСК НОВОЙ СДЕЛКИ (СКАНЕР СТАКАНА)
-        depth = client.futures_order_book(symbol=SYMBOL, limit=100)
-        bid_p, bid_vol = find_whale_walls(depth['bids'])
-        ask_p, ask_vol = find_whale_walls(depth['asks'])
-
-        if bid_p and ask_p:
-            gap = (ask_p - bid_p) / bid_p
-            curr_p = float(depth['bids'][0][0])
-            
-            if gap <= RANGE_MAX:
-                # Вход от нижней стенки
-                if curr_p <= bid_p + (ask_p - bid_p) * 0.2:
-                    entry_p = bid_p + 0.10
-                    stop_p = entry_p * (1 - START_SL)
-                    active_trades[SYMBOL] = {
-                        'side': 'LONG', 'entry': entry_p, 'stop': stop_p, 'is_be': False
-                    }
-                    send_tg(f"⚡️ *БУМАЖНЫЙ LONG BNB*\nВход: `{entry_p}`\nСтена снизу: `{bid_vol:.0f} BNB`")
+            # СТОП И ПЕРЕЗАХОД
+            stop_hit = (side == 'LONG' and curr_p <= trade['stop']) or (side == 'SHORT' and curr_p >= trade['stop'])
+            if stop_hit:
+                # Проверяем, осталась ли стена для перезахода
+                depth = client.futures_order_book(symbol=SYMBOL, limit=100)
+                wall_p, wall_v = find_wall(depth['bids'] if side == 'LONG' else depth['asks'])
                 
-                # Вход от верхней стенки
-                elif curr_p >= ask_p - (ask_p - bid_p) * 0.2:
-                    entry_p = ask_p - 0.10
-                    stop_p = entry_p * (1 + START_SL)
-                    active_trades[SYMBOL] = {
-                        'side': 'SHORT', 'entry': entry_p, 'stop': stop_p, 'is_be': False
-                    }
-                    send_tg(f"⚡️ *БУМАЖНЫЙ SHORT BNB*\nВход: `{entry_p}`\nСтена сверху: `{ask_vol:.0f} BNB`")
+                if wall_v >= WALL_SIZE and RETRY_COUNT.get(SYMBOL, 0) < 1:
+                    RETRY_COUNT[SYMBOL] = RETRY_COUNT.get(SYMBOL, 0) + 1
+                    send_tg(f"🔄 Выбило стоп, но стена на месте! Перезахожу в {side} {SYMBOL}")
+                    trade['entry'] = curr_p # Новый вход
+                else:
+                    send_tg(f"❌ Стоп-лосс по {SYMBOL}. Переворачиваюсь или жду новую стену.")
+                    del active_trades[SYMBOL]
+                    RETRY_COUNT[SYMBOL] = 0
+                return "Stop or Retry"
 
-        return "Сканирую стакан BNB на наличие китов..."
+        # 2. ПОИСК СТЕН (Группировка 10.0)
+        depth = client.futures_order_book(symbol=SYMBOL, limit=100)
+        bid_p, bid_v = find_wall(depth['bids']) # Пол
+        ask_p, ask_v = find_wall(depth['asks']) # Потолок
+
+        if bid_v >= WALL_SIZE and SYMBOL not in active_trades:
+            if curr_p <= bid_p + 2.0: # Если подошли близко к нижней стене
+                active_trades[SYMBOL] = {'side': 'LONG', 'entry': curr_p, 'stop': curr_p * (1 - START_SL), 'is_be': False}
+                send_tg(f"🧱 Вижу стену снизу: {bid_v:.0f} BNB. Вхожу в LONG!")
+
+        elif ask_v >= WALL_SIZE and SYMBOL not in active_trades:
+            if curr_p >= ask_p - 2.0: # Если подошли близко к верхней стене
+                active_trades[SYMBOL] = {'side': 'SHORT', 'entry': curr_p, 'stop': curr_p * (1 + START_SL), 'is_be': False}
+                send_tg(f"🧱 Вижу стену сверху: {ask_v:.0f} BNB. Вхожу в SHORT!")
+
+        return f"Цена: {curr_p}. Стены: Покупка {bid_v:.0f}, Продажа {ask_v:.0f}"
 
     except Exception as e:
-        return f"Ошибка: {e}", 400
+        return str(e), 400
+
+def find_wall(data):
+    # Группировка данных по 10 баксов
+    walls = {}
+    for p, q in data:
+        level = (float(p) // AGGREGATION) * AGGREGATION
+        walls[level] = walls.get(level, 0) + float(q)
+    
+    if not walls: return 0, 0
+    best_level = max(walls, key=walls.get)
+    return best_level, walls[best_level]
 
 if __name__ == "__main__":
     app.run(host='0.0.0.0', port=10000)
