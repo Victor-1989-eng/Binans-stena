@@ -12,7 +12,7 @@ app = Flask(__name__)
 # --- НАСТРОЙКИ ---
 SYMBOL = 'BNB/USDC'  # Убедись, что на балансе именно USDC
 TRADE_AMOUNT_CURRENCY = 3.0 
-LEVERAGE = 20
+LEVERAGE = 2
 STEP = 2.0
 PROFIT_GOAL = 4.0
 
