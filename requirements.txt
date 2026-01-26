@@ -2,3 +2,5 @@ python-binance
 flask
 requests
 gunicorn
+pandas
+pandas-ta
