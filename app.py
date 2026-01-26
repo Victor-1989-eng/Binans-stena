@@ -10,7 +10,7 @@ from flask import Flask
 app = Flask(__name__)
 
 # --- НАСТРОЙКИ ---
-SYMBOL = 'BNB/USDC'  # Убедись, что на балансе именно USDC
+SYMBOL = 'BNB/USDC' 
 TRADE_AMOUNT_CURRENCY = 3.0 
 LEVERAGE = 2
 STEP = 2.0
@@ -47,7 +47,7 @@ def get_market_sentiment():
         return "SHORT", "Ошибка анализа"
 
 def bot_worker():
-    send_tg("🚀 *БОТ В СЕТИ!* Ошибка 1106 исправлена. Начинаю работу.")
+    send_tg("🚀 *БОТ ОБНОВЛЕН!* Исправлена ошибка 'entryPrice'.")
     try: exchange.set_leverage(LEVERAGE, SYMBOL)
     except: pass
 
@@ -70,37 +70,39 @@ def bot_worker():
                 
                 if side == "SHORT":
                     exchange.create_order(SYMBOL, 'market', 'sell', qty, params={'positionSide': 'SHORT'})
-                    tp_price = float(exchange.price_to_precision(SYMBOL, curr_p - PROFIT_GOAL))
-                    # БЕЗ reduceOnly для Hedge Mode
-                    exchange.create_order(SYMBOL, 'limit', 'buy', qty, tp_price, params={'positionSide': 'SHORT'})
-                    send_tg(f"📉 *SHORT* по `{curr_p}`. Тейк: `{tp_price}`\nПричина: {reason}")
+                    tp_p = float(exchange.price_to_precision(SYMBOL, curr_p - PROFIT_GOAL))
+                    exchange.create_order(SYMBOL, 'limit', 'buy', qty, tp_p, params={'positionSide': 'SHORT'})
+                    send_tg(f"📉 *SHORT* по `{curr_p}`. Тейк: `{tp_p}`\nПричина: {reason}")
                 else:
                     exchange.create_order(SYMBOL, 'market', 'buy', qty, params={'positionSide': 'LONG'})
-                    tp_price = float(exchange.price_to_precision(SYMBOL, curr_p + PROFIT_GOAL))
-                    # БЕЗ reduceOnly для Hedge Mode
-                    exchange.create_order(SYMBOL, 'limit', 'sell', qty, tp_price, params={'positionSide': 'LONG'})
-                    send_tg(f"📈 *LONG* по `{curr_p}`. Тейк: `{tp_price}`\nПричина: {reason}")
+                    tp_p = float(exchange.price_to_precision(SYMBOL, curr_p + PROFIT_GOAL))
+                    exchange.create_order(SYMBOL, 'limit', 'sell', qty, tp_p, params={'positionSide': 'LONG'})
+                    send_tg(f"📈 *LONG* по `{curr_p}`. Тейк: `{tp_p}`\nПричина: {reason}")
 
-            # 2. ЛОГИКА ЗАМКА
+            # 2. ЛОГИКА ЗАМКА (С БЕЗОПАСНЫМ ПОЛУЧЕНИЕМ ЦЕНЫ)
+            # Для Шорта
             if short_amt > 0 and long_amt == 0:
-                pos_info = [p for p in positions if p['symbol'] == clean_symbol and p['positionSide'] == 'SHORT'][0]
-                entry_s = float(pos_info['entryPrice'])
-                if curr_p >= (entry_s + STEP):
-                    qty = float(exchange.amount_to_precision(SYMBOL, short_amt))
-                    exchange.create_order(SYMBOL, 'market', 'buy', qty, params={'positionSide': 'LONG'})
-                    tp_l = float(exchange.price_to_precision(SYMBOL, curr_p + PROFIT_GOAL))
-                    exchange.create_order(SYMBOL, 'limit', 'sell', qty, tp_l, params={'positionSide': 'LONG'})
-                    send_tg(f"🔒 *ЗАМОК (Лонг)* по `{curr_p}`. Тейк: `{tp_l}`")
+                pos_list = [p for p in positions if p['symbol'] == clean_symbol and p['positionSide'] == 'SHORT']
+                if pos_list:
+                    entry_s = float(pos_list[0].get('entryPrice', pos_list[0].get('entry_price', 0)))
+                    if entry_s > 0 and curr_p >= (entry_s + STEP):
+                        qty = float(exchange.amount_to_precision(SYMBOL, short_amt))
+                        exchange.create_order(SYMBOL, 'market', 'buy', qty, params={'positionSide': 'LONG'})
+                        tp_l = float(exchange.price_to_precision(SYMBOL, curr_p + PROFIT_GOAL))
+                        exchange.create_order(SYMBOL, 'limit', 'sell', qty, tp_l, params={'positionSide': 'LONG'})
+                        send_tg(f"🔒 *ЗАМОК (Лонг)* по `{curr_p}`. Тейк: `{tp_l}`")
 
+            # Для Лонга
             if long_amt > 0 and short_amt == 0:
-                pos_info = [p for p in positions if p['symbol'] == clean_symbol and p['positionSide'] == 'LONG'][0]
-                entry_l = float(pos_info['entryPrice'])
-                if curr_p <= (entry_l - STEP):
-                    qty = float(exchange.amount_to_precision(SYMBOL, long_amt))
-                    exchange.create_order(SYMBOL, 'market', 'sell', qty, params={'positionSide': 'SHORT'})
-                    tp_s = float(exchange.price_to_precision(SYMBOL, curr_p - PROFIT_GOAL))
-                    exchange.create_order(SYMBOL, 'limit', 'buy', qty, tp_s, params={'positionSide': 'SHORT'})
-                    send_tg(f"🔒 *ЗАМОК (Шорт)* по `{curr_p}`. Тейк: `{tp_s}`")
+                pos_list = [p for p in positions if p['symbol'] == clean_symbol and p['positionSide'] == 'LONG']
+                if pos_list:
+                    entry_l = float(pos_list[0].get('entryPrice', pos_list[0].get('entry_price', 0)))
+                    if entry_l > 0 and curr_p <= (entry_l - STEP):
+                        qty = float(exchange.amount_to_precision(SYMBOL, long_amt))
+                        exchange.create_order(SYMBOL, 'market', 'sell', qty, params={'positionSide': 'SHORT'})
+                        tp_s = float(exchange.price_to_precision(SYMBOL, curr_p - PROFIT_GOAL))
+                        exchange.create_order(SYMBOL, 'limit', 'buy', qty, tp_s, params={'positionSide': 'SHORT'})
+                        send_tg(f"🔒 *ЗАМОК (Шорт)* по `{curr_p}`. Тейк: `{tp_s}`")
 
         except Exception as e:
             send_tg(f"⚠️ *Ошибка:* `{str(e)}`")
