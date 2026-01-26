@@ -10,7 +10,7 @@ app = Flask(__name__)
 
 # --- ГЛОБАЛЬНЫЕ НАСТРОЙКИ ---
 SYMBOL = 'BNB/USDC'  # Или BNB/USDT
-TRADE_AMOUNT_USDC = 5.0  # Сумма одного входа
+TRADE_AMOUNT_USDC = 3.5  # Сумма одного входа
 LEVERAGE = 20
 STEP = 2.0
 PROFIT_GOAL = 4.0
