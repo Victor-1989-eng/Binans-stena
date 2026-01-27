@@ -116,9 +116,9 @@ def bot_worker():
             # Если ошибка в поиске позиции - бот напишет об этом
             if "StopIteration" not in str(e):
                 send_tg(f"⚠️ *Ошибка:* `{str(e)[:80]}`")
-            time.sleep(10)
+            time.sleep(30)
         
-        time.sleep(10) # 10 секунд — теперь бот проверяет очень часто
+        time.sleep(30) # 10 секунд — теперь бот проверяет очень часто
 
 threading.Thread(target=bot_worker, daemon=True).start()
 
