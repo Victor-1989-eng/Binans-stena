@@ -45,7 +45,7 @@ def get_market_sentiment():
 
 def bot_worker():
     global stats
-    send_tg("🎯 *ВЕРСИЯ 5.4:* Агрессивный замок активирован.")
+    send_tg("🛡️ *ЗАПУСК v5.5 (FINAL):* Защита от дублей + пауза 35с.")
     try: 
         exchange.load_markets()
         exchange.set_leverage(LEVERAGE, SYMBOL)
@@ -53,9 +53,9 @@ def bot_worker():
 
     while True:
         try:
-            # Получаем позиции через fetch_positions (более надежный метод ccxt)
+            # 1. ПОЛУЧАЕМ ДАННЫЕ
             all_positions = exchange.fetch_positions([SYMBOL])
-            active_ps = [p for p in all_positions if float(p['contracts']) > 0]
+            active_ps = [p for p in all_positions if float(p.get('contracts', 0)) > 0]
             
             pos_data = {p['side'].upper(): abs(float(p['contracts'])) for p in active_ps}
             long_amt = pos_data.get('LONG', 0)
@@ -64,11 +64,11 @@ def bot_worker():
             ticker = exchange.fetch_ticker(SYMBOL)
             curr_p = float(ticker['last'])
 
-            # 1. ЛОГИКА ВХОДА
+            # 2. НОВЫЙ ВХОД (Если позиций нет)
             if long_amt == 0 and short_amt == 0:
                 if stats["cycles"] > 0:
                     stats["profit"] += PROFIT_GOAL 
-                    send_tg(f"💰 *ПРОФИТ!* Всего: `{round(stats['profit'], 2)}` USDC")
+                    send_tg(f"💰 *ЦИКЛ ЗАВЕРШЕН!* \nВсего профита: `{round(stats['profit'], 2)}` USDC")
 
                 exchange.cancel_all_orders(SYMBOL)
                 side, _ = get_market_sentiment()
@@ -79,46 +79,49 @@ def bot_worker():
                     exchange.create_order(SYMBOL, 'market', 'sell', qty, params={'positionSide': 'SHORT'})
                     tp_p = float(exchange.price_to_precision(SYMBOL, curr_p - PROFIT_GOAL))
                     exchange.create_order(SYMBOL, 'limit', 'buy', qty, tp_p, params={'positionSide': 'SHORT'})
-                    send_tg(f"📉 *SHORT* по `{curr_p}`")
+                    send_tg(f"📉 *Вход SHORT* по `{curr_p}`")
                 else:
                     exchange.create_order(SYMBOL, 'market', 'buy', qty, params={'positionSide': 'LONG'})
                     tp_p = float(exchange.price_to_precision(SYMBOL, curr_p + PROFIT_GOAL))
                     exchange.create_order(SYMBOL, 'limit', 'sell', qty, tp_p, params={'positionSide': 'LONG'})
-                    send_tg(f"📈 *LONG* по `{curr_p}`")
+                    send_tg(f"📈 *Вход LONG* по `{curr_p}`")
                 stats["cycles"] += 1
 
-            # 2. ПРОВЕРКА ЗАМКА (Максимальная надежность)
-            # Мы в Шорте, цена растет
+            # 3. ЛОГИКА ЗАМКА С ЗАЩИТОЙ
+            # Если только Шорт и цена ушла вверх
             if short_amt > 0 and long_amt == 0:
                 p = next(x for x in active_ps if x['side'].upper() == 'SHORT' or x['info'].get('positionSide') == 'SHORT')
                 entry_s = float(p.get('entryPrice', p['info'].get('entryPrice', 0)))
                 
-                # Условие: если цена ушла ВЫШЕ на STEP или БОЛЕЕ
                 if entry_s > 0 and curr_p >= (entry_s + STEP - 0.1):
+                    # Отменяем старые тейки и открываем Лонг 1:1
+                    exchange.cancel_all_orders(SYMBOL)
                     exchange.create_order(SYMBOL, 'market', 'buy', short_amt, params={'positionSide': 'LONG'})
                     tp_l = float(exchange.price_to_precision(SYMBOL, curr_p + PROFIT_GOAL))
                     exchange.create_order(SYMBOL, 'limit', 'sell', short_amt, tp_l, params={'positionSide': 'LONG'})
-                    send_tg(f"🔒 *ЗАМОК ОТКРЫТ (LONG)*\nЦена: `{curr_p}` (Вход: `{entry_s}`)")
+                    send_tg(f"🔒 *ЗАМОК ОТКРЫТ (LONG)*\nОбъем: `{short_amt}`")
+                    time.sleep(5) # Задержка, чтобы биржа "увидела" ордер
 
-            # Мы в Лонге, цена падает
+            # Если только Лонг и цена ушла вниз
             if long_amt > 0 and short_amt == 0:
                 p = next(x for x in active_ps if x['side'].upper() == 'LONG' or x['info'].get('positionSide') == 'LONG')
                 entry_l = float(p.get('entryPrice', p['info'].get('entryPrice', 0)))
                 
-                # Условие: если цена ушла НИЖЕ на STEP или БОЛЕЕ
                 if entry_l > 0 and curr_p <= (entry_l - STEP + 0.1):
+                    exchange.cancel_all_orders(SYMBOL)
                     exchange.create_order(SYMBOL, 'market', 'sell', long_amt, params={'positionSide': 'SHORT'})
                     tp_s = float(exchange.price_to_precision(SYMBOL, curr_p - PROFIT_GOAL))
                     exchange.create_order(SYMBOL, 'limit', 'buy', long_amt, tp_s, params={'positionSide': 'SHORT'})
-                    send_tg(f"🔒 *ЗАМОК ОТКРЫТ (SHORT)*\nЦена: `{curr_p}` (Вход: `{entry_l}`)")
+                    send_tg(f"🔒 *ЗАМОК ОТКРЫТ (SHORT)*\nОбъем: `{long_amt}`")
+                    time.sleep(5)
 
         except Exception as e:
-            # Если ошибка в поиске позиции - бот напишет об этом
-            if "StopIteration" not in str(e):
-                send_tg(f"⚠️ *Ошибка:* `{str(e)[:80]}`")
-            time.sleep(30)
+            err_msg = str(e)
+            if "StopIteration" not in err_msg:
+                send_tg(f"⚠️ *Ошибка:* `{err_msg[:80]}`")
+                time.sleep(35)
         
-        time.sleep(30) # 10 секунд — теперь бот проверяет очень часто
+        time.sleep(35) # Безопасный интервал для Render
 
 threading.Thread(target=bot_worker, daemon=True).start()
 
