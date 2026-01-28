@@ -17,6 +17,7 @@ STEP = 2.0
 PROFIT_GOAL = 4.0
 
 stats = {"cycles": 0, "profit": 0.0}
+lock_fired = False # Флаг из 5.8 (замок 1 раз за цикл)
 
 exchange = ccxt.binance({
     'apiKey': os.environ.get('BINANCE_API_KEY'),
@@ -44,8 +45,9 @@ def get_market_sentiment():
     except: return "SHORT", "Error"
 
 def bot_worker():
-    global stats
-    send_tg("🛠 *ОБНОВЛЕНИЕ v5.6:* Исправлена логика тейков при замке.")
+    global stats, lock_fired
+    send_tg("🚀 *ГИБРИД 6.1 ЗАПУЩЕН!*\nЛогика 5.8 + Бумажный Трейлинг-Тейк.")
+    
     try: 
         exchange.load_markets()
         exchange.set_leverage(LEVERAGE, SYMBOL)
@@ -53,7 +55,7 @@ def bot_worker():
 
     while True:
         try:
-            # 1. ПОЛУЧАЕМ ДАННЫЕ
+            # 1. СБОР ДАННЫХ
             all_positions = exchange.fetch_positions([SYMBOL])
             active_ps = [p for p in all_positions if float(p.get('contracts', 0)) > 0]
             
@@ -64,13 +66,15 @@ def bot_worker():
             ticker = exchange.fetch_ticker(SYMBOL)
             curr_p = float(ticker['last'])
 
-            # 2. НОВЫЙ ВХОД (Если всё чисто)
+            # 2. НОВЫЙ ВХОД (Сброс цикла)
             if long_amt == 0 and short_amt == 0:
                 if stats["cycles"] > 0:
                     stats["profit"] += PROFIT_GOAL 
-                    send_tg(f"💰 *ЦИКЛ ЗАВЕРШЕН!* \nВсего профита: `{round(stats['profit'], 2)}` USDC")
+                    send_tg(f"💰 *ПРОФИТ!* Всего: `{round(stats['profit'], 2)}` USDC")
 
-                exchange.cancel_all_orders(SYMBOL) # Чистим только когда позиций НЕТ
+                lock_fired = False # Сброс флага замка
+                exchange.cancel_all_orders(SYMBOL)
+                
                 side, _ = get_market_sentiment()
                 raw_qty = (TRADE_AMOUNT_CURRENCY * LEVERAGE) / curr_p
                 qty = float(exchange.amount_to_precision(SYMBOL, raw_qty))
@@ -85,45 +89,58 @@ def bot_worker():
                     tp_p = float(exchange.price_to_precision(SYMBOL, curr_p + PROFIT_GOAL))
                     exchange.create_order(SYMBOL, 'limit', 'sell', qty, tp_p, params={'positionSide': 'LONG'})
                     send_tg(f"📈 *Вход LONG* по `{curr_p}`")
+                
                 stats["cycles"] += 1
 
-            # 3. ЛОГИКА ЗАМКА (БЕЗ УДАЛЕНИЯ СТАРЫХ ТЕЙКОВ)
-            # Шорт в минусе -> Открываем Лонг
-            if short_amt > 0 and long_amt == 0:
+            # 3. ЛОГИКА БУМАЖНОГО БОТА (Перестановка тейков)
+            # Если Лонг закрылся по тейку, а Шорт остался - переставляем тейк Шорта выше
+            if short_amt > 0 and long_amt == 0 and lock_fired:
+                exchange.cancel_all_orders(SYMBOL)
+                new_tp = float(exchange.price_to_precision(SYMBOL, curr_p - PROFIT_GOAL))
+                exchange.create_order(SYMBOL, 'limit', 'buy', short_amt, new_tp, params={'positionSide': 'SHORT'})
+                send_tg(f"🔄 *БУМАЖНЫЙ ХОД:* Подтянул тейк Шорта на `{new_tp}`")
+                lock_fired = False # Даем шанс на новый замок, если цена снова улетит
+
+            # Если Шорт закрылся по тейку, а Лонг остался - подтягиваем тейк Лонга ниже
+            if long_amt > 0 and short_amt == 0 and lock_fired:
+                exchange.cancel_all_orders(SYMBOL)
+                new_tp = float(exchange.price_to_precision(SYMBOL, curr_p + PROFIT_GOAL))
+                exchange.create_order(SYMBOL, 'limit', 'sell', long_amt, new_tp, params={'positionSide': 'LONG'})
+                send_tg(f"🔄 *БУМАЖНЫЙ ХОД:* Подтянул тейк Лонга на `{new_tp}`")
+                lock_fired = False
+
+            # 4. ЗАМОК (Логика 5.8 с проверкой входа)
+            if short_amt > 0 and long_amt == 0 and not lock_fired:
                 p = next(x for x in active_ps if x['info'].get('positionSide') == 'SHORT')
                 entry_s = float(p.get('entryPrice', p['info'].get('entryPrice', 0)))
-                
                 if entry_s > 0 and curr_p >= (entry_s + STEP - 0.1):
-                    # Открываем только Лонг и его тейк. Тейк Шорта не трогаем!
                     exchange.create_order(SYMBOL, 'market', 'buy', short_amt, params={'positionSide': 'LONG'})
                     tp_l = float(exchange.price_to_precision(SYMBOL, curr_p + PROFIT_GOAL))
                     exchange.create_order(SYMBOL, 'limit', 'sell', short_amt, tp_l, params={'positionSide': 'LONG'})
-                    send_tg(f"🔒 *ЗАМОК ОТКРЫТ (LONG)*\nТейк лонга: `{tp_l}`. Тейк шорта сохранен.")
-                    time.sleep(5)
+                    lock_fired = True
+                    send_tg(f"🔒 *ЗАМОК (LONG)* открыт по `{curr_p}`")
 
-            # Лонг в минусе -> Открываем Шорт
-            if long_amt > 0 and short_amt == 0:
+            if long_amt > 0 and short_amt == 0 and not lock_fired:
                 p = next(x for x in active_ps if x['info'].get('positionSide') == 'LONG')
                 entry_l = float(p.get('entryPrice', p['info'].get('entryPrice', 0)))
-                
                 if entry_l > 0 and curr_p <= (entry_l - STEP + 0.1):
                     exchange.create_order(SYMBOL, 'market', 'sell', long_amt, params={'positionSide': 'SHORT'})
                     tp_s = float(exchange.price_to_precision(SYMBOL, curr_p - PROFIT_GOAL))
                     exchange.create_order(SYMBOL, 'limit', 'buy', long_amt, tp_s, params={'positionSide': 'SHORT'})
-                    send_tg(f"🔒 *ЗАМОК ОТКРЫТ (SHORT)*\nТейк шорта: `{tp_s}`. Тейк лонга сохранен.")
-                    time.sleep(5)
+                    lock_fired = True
+                    send_tg(f"🔒 *ЗАМОК (SHORT)* открыт по `{curr_p}`")
 
         except Exception as e:
             if "StopIteration" not in str(e):
                 send_tg(f"⚠️ *Ошибка:* `{str(e)[:80]}`")
             time.sleep(35)
         
-        time.sleep(35)
+        time.sleep(35) # Безопасная пауза 35 сек
 
 threading.Thread(target=bot_worker, daemon=True).start()
 
 @app.route('/')
-def health(): return "Ready", 200
+def health(): return "Active", 200
 
 if __name__ == "__main__":
     app.run(host='0.0.0.0', port=10000)
