@@ -45,7 +45,7 @@ def get_market_sentiment():
 
 def bot_worker():
     global stats
-    send_tg("🛡️ *ЗАПУСК v5.5 (FINAL):* Защита от дублей + пауза 35с.")
+    send_tg("🛠 *ОБНОВЛЕНИЕ v5.6:* Исправлена логика тейков при замке.")
     try: 
         exchange.load_markets()
         exchange.set_leverage(LEVERAGE, SYMBOL)
@@ -64,13 +64,13 @@ def bot_worker():
             ticker = exchange.fetch_ticker(SYMBOL)
             curr_p = float(ticker['last'])
 
-            # 2. НОВЫЙ ВХОД (Если позиций нет)
+            # 2. НОВЫЙ ВХОД (Если всё чисто)
             if long_amt == 0 and short_amt == 0:
                 if stats["cycles"] > 0:
                     stats["profit"] += PROFIT_GOAL 
                     send_tg(f"💰 *ЦИКЛ ЗАВЕРШЕН!* \nВсего профита: `{round(stats['profit'], 2)}` USDC")
 
-                exchange.cancel_all_orders(SYMBOL)
+                exchange.cancel_all_orders(SYMBOL) # Чистим только когда позиций НЕТ
                 side, _ = get_market_sentiment()
                 raw_qty = (TRADE_AMOUNT_CURRENCY * LEVERAGE) / curr_p
                 qty = float(exchange.amount_to_precision(SYMBOL, raw_qty))
@@ -87,41 +87,38 @@ def bot_worker():
                     send_tg(f"📈 *Вход LONG* по `{curr_p}`")
                 stats["cycles"] += 1
 
-            # 3. ЛОГИКА ЗАМКА С ЗАЩИТОЙ
-            # Если только Шорт и цена ушла вверх
+            # 3. ЛОГИКА ЗАМКА (БЕЗ УДАЛЕНИЯ СТАРЫХ ТЕЙКОВ)
+            # Шорт в минусе -> Открываем Лонг
             if short_amt > 0 and long_amt == 0:
-                p = next(x for x in active_ps if x['side'].upper() == 'SHORT' or x['info'].get('positionSide') == 'SHORT')
+                p = next(x for x in active_ps if x['info'].get('positionSide') == 'SHORT')
                 entry_s = float(p.get('entryPrice', p['info'].get('entryPrice', 0)))
                 
                 if entry_s > 0 and curr_p >= (entry_s + STEP - 0.1):
-                    # Отменяем старые тейки и открываем Лонг 1:1
-                    exchange.cancel_all_orders(SYMBOL)
+                    # Открываем только Лонг и его тейк. Тейк Шорта не трогаем!
                     exchange.create_order(SYMBOL, 'market', 'buy', short_amt, params={'positionSide': 'LONG'})
                     tp_l = float(exchange.price_to_precision(SYMBOL, curr_p + PROFIT_GOAL))
                     exchange.create_order(SYMBOL, 'limit', 'sell', short_amt, tp_l, params={'positionSide': 'LONG'})
-                    send_tg(f"🔒 *ЗАМОК ОТКРЫТ (LONG)*\nОбъем: `{short_amt}`")
-                    time.sleep(5) # Задержка, чтобы биржа "увидела" ордер
+                    send_tg(f"🔒 *ЗАМОК ОТКРЫТ (LONG)*\nТейк лонга: `{tp_l}`. Тейк шорта сохранен.")
+                    time.sleep(5)
 
-            # Если только Лонг и цена ушла вниз
+            # Лонг в минусе -> Открываем Шорт
             if long_amt > 0 and short_amt == 0:
-                p = next(x for x in active_ps if x['side'].upper() == 'LONG' or x['info'].get('positionSide') == 'LONG')
+                p = next(x for x in active_ps if x['info'].get('positionSide') == 'LONG')
                 entry_l = float(p.get('entryPrice', p['info'].get('entryPrice', 0)))
                 
                 if entry_l > 0 and curr_p <= (entry_l - STEP + 0.1):
-                    exchange.cancel_all_orders(SYMBOL)
                     exchange.create_order(SYMBOL, 'market', 'sell', long_amt, params={'positionSide': 'SHORT'})
                     tp_s = float(exchange.price_to_precision(SYMBOL, curr_p - PROFIT_GOAL))
                     exchange.create_order(SYMBOL, 'limit', 'buy', long_amt, tp_s, params={'positionSide': 'SHORT'})
-                    send_tg(f"🔒 *ЗАМОК ОТКРЫТ (SHORT)*\nОбъем: `{long_amt}`")
+                    send_tg(f"🔒 *ЗАМОК ОТКРЫТ (SHORT)*\nТейк шорта: `{tp_s}`. Тейк лонга сохранен.")
                     time.sleep(5)
 
         except Exception as e:
-            err_msg = str(e)
-            if "StopIteration" not in err_msg:
-                send_tg(f"⚠️ *Ошибка:* `{err_msg[:80]}`")
-                time.sleep(35)
+            if "StopIteration" not in str(e):
+                send_tg(f"⚠️ *Ошибка:* `{str(e)[:80]}`")
+            time.sleep(35)
         
-        time.sleep(35) # Безопасный интервал для Render
+        time.sleep(35)
 
 threading.Thread(target=bot_worker, daemon=True).start()
 
