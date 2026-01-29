@@ -2,7 +2,6 @@ import os
 import time
 import threading
 import pandas as pd
-import pandas_ta as ta
 import ccxt
 import requests
 from flask import Flask
@@ -13,7 +12,8 @@ app = Flask(__name__)
 SYMBOL = 'BNB/USDC' 
 TRADE_AMOUNT_CURRENCY = 3.5 
 LEVERAGE = 20
-PROFIT_GOAL = 3.5 # Чуть уменьшил тейк для более быстрых выходов на 1м
+PROFIT_GOAL = 3.0 # Короткий тейк для работы в канале
+LOOKBACK_MINUTES = 60 # За какой период искать Хай и Лоу
 
 stats = {"cycles": 0, "profit": 0.0}
 
@@ -33,28 +33,21 @@ def send_tg(text):
             requests.post(url, json={"chat_id": chat_id, "text": text, "parse_mode": "Markdown"}, timeout=10)
         except: pass
 
-def get_market_sentiment():
+def get_channel_extrema():
     try:
-        # Запрашиваем минутные свечи
-        bars = exchange.fetch_ohlcv(SYMBOL, timeframe='1m', limit=50)
+        # Берем данные за последние 60 минут
+        bars = exchange.fetch_ohlcv(SYMBOL, timeframe='1m', limit=LOOKBACK_MINUTES)
         df = pd.DataFrame(bars, columns=['ts', 'o', 'h', 'l', 'c', 'v'])
         
-        # Считаем быстрый RSI
-        df['rsi'] = ta.rsi(df['c'], length=14)
-        current_rsi = df['rsi'].iloc[-1]
-        
-        # Границы для 1-минутного таймфрейма (более жесткие)
-        if current_rsi >= 75:
-            return "SHORT", f"RSI: {round(current_rsi, 1)} (ПЕРЕКУПЛЕННОСТЬ)"
-        elif current_rsi <= 25:
-            return "LONG", f"RSI: {round(current_rsi, 1)} (ПЕРЕПРОДАННОСТЬ)"
-        
-        return None, f"RSI: {round(current_rsi, 1)} (ОЖИДАНИЕ)"
-    except: return None, "Ошибка данных"
+        local_max = df['h'].max()
+        local_min = df['l'].min()
+        return local_max, local_min
+    except:
+        return None, None
 
 def bot_worker():
     global stats
-    send_tg("🎯 *ВЕРСИЯ 6.3 (Снайпер 1m):* Вход только на разворотах RSI.")
+    send_tg(f"🏛️ *ВЕРСИЯ 7.0:* Работа от границ канала ({LOOKBACK_MINUTES} мин).")
     
     while True:
         try:
@@ -62,35 +55,44 @@ def bot_worker():
             active_ps = [p for p in all_positions if float(p.get('contracts', 0)) > 0]
             
             if not active_ps:
-                side, reason = get_market_sentiment()
+                l_max, l_min = get_channel_extrema()
+                ticker = exchange.fetch_ticker(SYMBOL)
+                curr_p = float(ticker['last'])
                 
-                if side:
-                    ticker = exchange.fetch_ticker(SYMBOL)
-                    curr_p = float(ticker['last'])
-                    
-                    raw_qty = (TRADE_AMOUNT_CURRENCY * LEVERAGE) / curr_p
-                    qty = float(exchange.amount_to_precision(SYMBOL, raw_qty))
-                    
-                    exchange.cancel_all_orders(SYMBOL)
-                    
-                    if side == "SHORT":
-                        exchange.create_order(SYMBOL, 'market', 'sell', qty, params={'positionSide': 'SHORT'})
-                        tp_p = float(exchange.price_to_precision(SYMBOL, curr_p - PROFIT_GOAL))
-                        exchange.create_order(SYMBOL, 'limit', 'buy', qty, tp_p, params={'positionSide': 'SHORT'})
-                    else:
-                        exchange.create_order(SYMBOL, 'market', 'buy', qty, params={'positionSide': 'LONG'})
-                        tp_p = float(exchange.price_to_precision(SYMBOL, curr_p + PROFIT_GOAL))
-                        exchange.create_order(SYMBOL, 'limit', 'sell', qty, tp_p, params={'positionSide': 'LONG'})
-                    
-                    send_tg(f"🚀 *ВХОД {side}*\nПричина: {reason}\nЦена: `{curr_p}`\nТейк: `{tp_p}`")
-                    stats["cycles"] += 1
-                
-            # Если позиция есть - бот просто спит и ждет тейка
+                if l_max and l_min:
+                    side = None
+                    # Если цена у верхней границы или выше
+                    if curr_p >= l_max:
+                        side = "SHORT"
+                        reason = f"Пик канала: {l_max}"
+                    # Если цена у нижней границы или ниже
+                    elif curr_p <= l_min:
+                        side = "LONG"
+                        reason = f"Дно канала: {l_min}"
+
+                    if side:
+                        raw_qty = (TRADE_AMOUNT_CURRENCY * LEVERAGE) / curr_p
+                        qty = float(exchange.amount_to_precision(SYMBOL, raw_qty))
+                        
+                        exchange.cancel_all_orders(SYMBOL)
+                        
+                        if side == "SHORT":
+                            exchange.create_order(SYMBOL, 'market', 'sell', qty, params={'positionSide': 'SHORT'})
+                            tp_p = float(exchange.price_to_precision(SYMBOL, curr_p - PROFIT_GOAL))
+                            exchange.create_order(SYMBOL, 'limit', 'buy', qty, tp_p, params={'positionSide': 'SHORT'})
+                        else:
+                            exchange.create_order(SYMBOL, 'market', 'buy', qty, params={'positionSide': 'LONG'})
+                            tp_p = float(exchange.price_to_precision(SYMBOL, curr_p + PROFIT_GOAL))
+                            exchange.create_order(SYMBOL, 'limit', 'sell', qty, tp_p, params={'positionSide': 'LONG'})
+                        
+                        send_tg(f"🚀 *ВХОД {side}*\n{reason}\nЦена: `{curr_p}`\nТейк: `{tp_p}`")
+                        stats["cycles"] += 1
+            
         except Exception as e:
             if "429" in str(e): time.sleep(60)
             else: time.sleep(10)
         
-        time.sleep(30) # Проверка каждые 30 секунд
+        time.sleep(30)
 
 threading.Thread(target=bot_worker, daemon=True).start()
 
