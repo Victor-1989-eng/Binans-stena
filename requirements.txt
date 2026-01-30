@@ -2,6 +2,5 @@ python-binance
 flask
 requests
 gunicorn
-pandas
-pandas-ta
-ccxt
+numpy
+pyTelegramBotAPI
