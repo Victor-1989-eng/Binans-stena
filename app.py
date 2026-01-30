@@ -1,4 +1,4 @@
-import os, requests, time, threading, numpy as np
+import os, time, threading, numpy as np
 import telebot
 from flask import Flask
 from binance.client import Client
@@ -6,88 +6,97 @@ from telebot import types
 
 app = Flask(__name__)
 
-# --- НАСТРОЙКИ ---
-SYMBOL = 'ZECUSDC'
+# --- НАСТРОЙКИ v.17.0 ---
+SYMBOLS = ['ZECUSDC', 'LTCUSDC', 'LINKUSDC', 'SOLUSDC'] # Наш "Золотой Квартет"
 LEVERAGE = 75
 RISK_USD = 1.0
-Z_THRESHOLD = 3.0  # Чувствительность (3.0 - консервативно, 2.0 - агрессивно)
+Z_THRESHOLD = 3.0 
 
-# Инициализация
 bot = telebot.TeleBot(os.environ.get("TELEGRAM_TOKEN"))
 chat_id = os.environ.get("CHAT_ID")
 
-def get_data():
-    client = Client(os.environ.get("BINANCE_API_KEY"), os.environ.get("BINANCE_API_SECRET"))
-    klines = client.futures_klines(symbol=SYMBOL, interval='1m', limit=60)
-    closes = [float(k[4]) for k in klines]
-    return np.array(closes)
+# Функция расчета Z-Score для конкретной монеты
+def get_symbol_stats(client, symbol):
+    klines = client.futures_klines(symbol=symbol, interval='1m', limit=60)
+    closes = np.array([float(k[4]) for k in klines])
+    curr_p = float(client.futures_symbol_ticker(symbol=symbol)['price'])
+    
+    mean = np.mean(closes)
+    std = np.std(closes)
+    z = (curr_p - mean) / std if std != 0 else 0
+    return z, curr_p
 
-# --- ИНТЕРФЕЙС КНОПОК ---
+# --- ИНТЕРФЕЙС ---
 @bot.message_handler(commands=['start'])
 def send_welcome(message):
     markup = types.ReplyKeyboardMarkup(resize_keyboard=True)
     markup.add('📊 Статус', '⚙️ Агрессивный (Z=2)', '🛡 Консервативный (Z=3)')
-    bot.reply_to(message, "Система ZEC-Math Sniper готова. Выбери режим:", reply_markup=markup)
+    bot.reply_to(message, "Система Multi-Math Sniper готова.\nМониторю: ZEC, LTC, LINK, SOL", reply_markup=markup)
 
 @bot.message_handler(func=lambda message: True)
 def handle_buttons(message):
     global Z_THRESHOLD
     if message.text == '📊 Статус':
-        bot.send_message(chat_id, f"Работаю по {SYMBOL}\nПлечо: x{LEVERAGE}\nТекущий Z-порог: {Z_THRESHOLD}")
+        bot.send_message(chat_id, f"📡 Сканирую: {', '.join(SYMBOLS)}\nПлечо: x{LEVERAGE}\nZ-порог: {Z_THRESHOLD}")
     elif message.text == '⚙️ Агрессивный (Z=2)':
         Z_THRESHOLD = 2.0
-        bot.send_message(chat_id, "Установлен агрессивный режим (больше сделок)")
+        bot.send_message(chat_id, "🚀 Режим: Агрессивный (Z=2)")
     elif message.text == '🛡 Консервативный (Z=3)':
         Z_THRESHOLD = 3.0
-        bot.send_message(chat_id, "Установлен консервативный режим (выше точность)")
+        bot.send_message(chat_id, "🛡 Режим: Консервативный (Z=3)")
 
 def main_loop():
     client = Client(os.environ.get("BINANCE_API_KEY"), os.environ.get("BINANCE_API_SECRET"))
-    bot.send_message(chat_id, "🚀 Бот запущен на паре ZEC/USDC")
+    bot.send_message(chat_id, "🚀 Бот-Мультиснайпер запущен и ищет аномалии...")
     
     while True:
-        try:
-            pos = client.futures_position_information(symbol=SYMBOL)
-            current_pos = next((p for p in pos if p['symbol'] == SYMBOL), None)
-            
-            if not (current_pos and float(current_pos['positionAmt']) != 0):
-                data = get_data()
-                curr_p = float(client.futures_symbol_ticker(symbol=SYMBOL)['price'])
+        for symbol in SYMBOLS:
+            try:
+                # Проверяем, нет ли позиции по ЭТОЙ монете
+                pos = client.futures_position_information(symbol=symbol)
+                has_pos = any(float(p['positionAmt']) != 0 for p in pos if p['symbol'] == symbol)
                 
-                mean = np.mean(data)
-                std = np.std(data)
-                z = (curr_p - mean) / std
+                if not has_pos:
+                    z, curr_p = get_symbol_stats(client, symbol)
+                    
+                    side = None
+                    if z < -Z_THRESHOLD: side = "BUY"
+                    elif z > Z_THRESHOLD: side = "SELL"
+                    
+                    if side:
+                        # Настройка точности лота (у каждой монеты своя)
+                        precision = 1 if symbol != 'LINKUSDC' else 0 # LINK требует целые числа
+                        
+                        stop_dist = curr_p * 0.006
+                        qty = round(RISK_USD / stop_dist, precision)
+                        if qty == 0: qty = 1.0 # Защита от слишком малого объема
+                        
+                        sl = round(curr_p - stop_dist if side == "BUY" else curr_p + stop_dist, 3)
+                        tp = round(curr_p + (stop_dist * 3) if side == "BUY" else curr_p - (stop_dist * 3), 3)
+                        
+                        client.futures_change_leverage(symbol=symbol, leverage=LEVERAGE)
+                        client.futures_create_order(symbol=symbol, side=side, type='MARKET', quantity=qty)
+                        
+                        opp = "SELL" if side == "BUY" else "BUY"
+                        # Стоп и Тейк по рынку (надежнее для волатильности)
+                        client.futures_create_order(symbol=symbol, side=opp, type='STOP_MARKET', stopPrice=str(sl), closePosition=True)
+                        client.futures_create_order(symbol=symbol, side=opp, type='TAKE_PROFIT_MARKET', stopPrice=str(tp), closePosition=True)
+                        
+                        bot.send_message(chat_id, f"🎯 *ВХОД {symbol}*\nZ-Score: `{z:.2f}`\nВход: `{curr_p}`\nЦель +$3: `{tp}`")
                 
-                side = None
-                if z < -Z_THRESHOLD: side = "BUY"
-                elif z > Z_THRESHOLD: side = "SELL"
-                
-                if side:
-                    stop_dist = curr_p * 0.006 # Для ZEC берем стоп чуть шире - 0.6%
-                    qty = round(RISK_USD / stop_dist, 1) # ZEC имеет меньше знаков после запятой
-                    
-                    sl = round(curr_p - stop_dist if side == "BUY" else curr_p + stop_dist, 3)
-                    tp = round(curr_p + (stop_dist * 3) if side == "BUY" else curr_p - (stop_dist * 3), 3)
-                    
-                    client.futures_change_leverage(symbol=SYMBOL, leverage=LEVERAGE)
-                    client.futures_create_order(symbol=SYMBOL, side=side, type='MARKET', quantity=qty)
-                    
-                    opp = "SELL" if side == "BUY" else "BUY"
-                    client.futures_create_order(symbol=SYMBOL, side=opp, type='STOP_MARKET', stopPrice=str(sl), closePosition=True)
-                    client.futures_create_order(symbol=SYMBOL, side=opp, type='LIMIT', price=str(tp), quantity=qty, timeInForce='GTC', reduceOnly=True)
-                    
-                    bot.send_message(chat_id, f"🎯 *MATH ENTRY (ZEC)*\nZ-Score: `{z:.2f}`\nВход: `{curr_p}`\nЦель (1:3): `{tp}`")
+                time.sleep(2) # Пауза между монетами, чтобы не спамить API
+            except Exception as e:
+                print(f"Ошибка по {symbol}: {e}")
+                time.sleep(5)
+        
+        time.sleep(15) # Отдых перед следующим кругом сканирования
 
-            time.sleep(20)
-        except Exception as e:
-            time.sleep(30)
-
-# Запуск потоков
+# Запуск
 threading.Thread(target=main_loop, daemon=True).start()
 threading.Thread(target=bot.infinity_polling, daemon=True).start()
 
 @app.route('/')
-def health(): return "ZEC Bot Active", 200
+def health(): return "Multi-Bot Active", 200
 
 if __name__ == "__main__":
     app.run(host='0.0.0.0', port=10000)
