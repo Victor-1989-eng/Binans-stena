@@ -8,7 +8,7 @@ app = Flask(__name__)
 SYMBOL = 'BNBUSDT'
 LEVERAGE = 75        
 RISK_USD = 1.0       # Риск всегда $1
-WALL_SIZE = 500      
+WALL_SIZE = 300      
 AGGREGATION = 0.5    
 
 def get_binance_client():
