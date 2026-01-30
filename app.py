@@ -4,9 +4,9 @@ from binance.client import Client
 
 app = Flask(__name__)
 
-# --- НАСТРОЙКИ v.13.0 ---
+# --- НАСТРОЙКИ v.13.2 (РЕЖИМ 75x) ---
 SYMBOL = 'BNBUSDT'
-LEVERAGE = 20        
+LEVERAGE = 75        
 RISK_USD = 1.0       # Риск всегда $1
 WALL_SIZE = 500      
 AGGREGATION = 0.5    
@@ -31,12 +31,12 @@ def find_walls(data):
 
 def main_loop():
     client = get_binance_client()
-    send_tg("🚀 *WHALE-SNIPER v.13.0 ЗАПУЩЕН*\nМатематика: Адаптивный 1:3 + БУ")
+    send_tg("🚀 *WHALE-SNIPER v.13.2 ЗАПУЩЕН*\nМатематика: Адаптивный 1:3 | Плечо x75")
     last_id = None
 
     while True:
         try:
-            # 1. СТАТИСТИКА
+            # 1. ОТЧЕТНОСТЬ
             trades = client.futures_account_trades(symbol=SYMBOL, limit=1)
             if trades and trades[0]['id'] != last_id:
                 pnl = float(trades[0]['realizedPnl'])
@@ -45,21 +45,11 @@ def main_loop():
                     send_tg(f"{icon} *ИТОГ СДЕЛКИ*\nРезультат: `{pnl:.2f} USDT`")
                 last_id = trades[0]['id']
 
-            # 2. ПРОВЕРКА ПОЗИЦИИ И БЕЗУБЫТКА
+            # 2. ПРОВЕРКА ПОЗИЦИИ
             pos = client.futures_position_information(symbol=SYMBOL)
             current_pos = next((p for p in pos if p['symbol'] == SYMBOL), None)
             
-            if current_pos and float(current_pos['positionAmt']) != 0:
-                amt = float(current_pos['positionAmt'])
-                entry_p = float(current_pos['entryPrice'])
-                mark_p = float(current_pos['markPrice'])
-                
-                # Логика перевода в безубыток (если прошли 1:1)
-                pnl_pct = (mark_p - entry_p) / entry_p if amt > 0 else (entry_p - mark_p) / entry_p
-                # Если прибыль составила 0.5% (стандартный стоп), двигаем стоп в БУ
-                # (Для простоты в этой версии оставим только вход, БУ добавим после теста входов)
-                
-            else:
+            if not (current_pos and float(current_pos['positionAmt']) != 0):
                 # 3. ПОИСК ВХОДА
                 depth = client.futures_order_book(symbol=SYMBOL, limit=100)
                 bid_wall = find_walls(depth['bids'])
@@ -74,12 +64,9 @@ def main_loop():
 
                 if side:
                     # АДАПТИВНАЯ МАТЕМАТИКА
-                    # Стоп за стенку на 0.15% от цены
                     stop_dist = abs(curr_p - wall_p) + (curr_p * 0.0015)
-                    
-                    # Защита от слишком короткого или длинного стопа
-                    stop_dist = max(stop_dist, curr_p * 0.002) # не меньше 0.2%
-                    stop_dist = min(stop_dist, curr_p * 0.01)  # не больше 1%
+                    stop_dist = max(stop_dist, curr_p * 0.002) 
+                    stop_dist = min(stop_dist, curr_p * 0.01)
 
                     qty = round(RISK_USD / stop_dist, 2)
                     sl = round(curr_p - stop_dist if side == "BUY" else curr_p + stop_dist, 2)
@@ -92,7 +79,7 @@ def main_loop():
                     client.futures_create_order(symbol=SYMBOL, side=opp, type='STOP_MARKET', stopPrice=str(sl), closePosition=True)
                     client.futures_create_order(symbol=SYMBOL, side=opp, type='LIMIT', price=str(tp), quantity=qty, timeInForce='GTC', reduceOnly=True)
                     
-                    send_tg(f"🐳 *ВХОД ОТ КИТА ({side})*\nСтена: `{wall_p}`\nСтоп (за стенку): `{sl}`\nЦель (1:3): `{tp}`")
+                    send_tg(f"🐳 *ВХОД ({side})*\nСтена: `{wall_p}`\nСтоп: `{sl}` | Тейк: `{tp}`")
 
             time.sleep(15)
         except Exception as e:
@@ -101,7 +88,7 @@ def main_loop():
 threading.Thread(target=main_loop, daemon=True).start()
 
 @app.route('/')
-def health(): return "Adaptive Bot Active", 200
+def health(): return "OK", 200
 
 if __name__ == "__main__":
     app.run(host='0.0.0.0', port=10000)
