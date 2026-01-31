@@ -1,6 +1,6 @@
-pyTelegramBotAPI
+
 python-binance
 flask
-numpy
 pandas
 gunicorn
+ccxt
