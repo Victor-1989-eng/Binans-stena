@@ -1,7 +1,4 @@
-pandas as pd
 ccxt
 pandas
 requests
 flask
-numpy
-
