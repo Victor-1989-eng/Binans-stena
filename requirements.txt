@@ -1,3 +1,4 @@
+pandas as pd
 ccxt
 pandas
 requests
