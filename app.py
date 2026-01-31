@@ -1,30 +1,31 @@
 import os
 import time
 import threading
-import pandas as pd
 import ccxt
 import requests
+import random
 from flask import Flask
 
 app = Flask(__name__)
 
 # --- НАСТРОЙКИ ---
 SYMBOL = 'BNB/USDC'
-RISK_USD = 10.0
-REWARD_USD = 30.0
-LOOKBACK_MINUTES = 60
+RISK_USD = 5.0        # маленький риск на сделку
 COMMISSION_RATE = 0.0004
-TOUCH_TOLERANCE = 0.001  # 0.1% допуск к границе
+STOP_PERCENT = 0.005   # 0.5%
+RR = 3                 # тейк = стоп * 3
 
 stats = {
     "balance": 1000.0,
-    "wins": 0, "losses": 0, "total_fees": 0.0,
-    "in_position": False, "side": None, "sl": 0, "tp": 0, "qty": 0
+    "wins": 0,
+    "losses": 0,
+    "total_fees": 0.0,
+    "in_position": False,
+    "side": None,
+    "sl": 0,
+    "tp": 0,
+    "qty": 0
 }
-
-touches_high = 0
-touches_low = 0
-last_touch_side = None
 
 exchange = ccxt.binance({'options': {'defaultType': 'future'}, 'enableRateLimit': True})
 
@@ -40,31 +41,22 @@ def send_tg(text):
         except:
             pass
 
-def get_channel_extrema():
-    try:
-        bars = exchange.fetch_ohlcv(SYMBOL, timeframe='1m', limit=LOOKBACK_MINUTES + 1)
-        df = pd.DataFrame(bars[:-1], columns=['ts', 'o', 'h', 'l', 'c', 'v'])
-        return df, df['h'].max(), df['l'].min()
-    except:
-        return None, None, None
-
 def bot_worker():
-    global stats, touches_high, touches_low, last_touch_side
-    send_tg("🎯 *v9.1 СНАЙПЕР 1:3 (ТРЕТЬЕ КАСАНИЕ)*\nЖду 3 касания + отказ от пробоя.")
+    global stats
+    send_tg("🎲 *МИНИ-РУЛЕТКА 1:3 ЗАПУЩЕНА*\nРиск на сделку 5$ | Стоп 0.5% | TP ×3 | Вход случайный 1/3")
 
     while True:
         try:
-            ticker = exchange.fetch_ticker(SYMBOL)
-            curr_p = ticker['last']
+            curr_p = exchange.fetch_ticker(SYMBOL)['last']
 
-            # --- ВЫХОД ---
+            # --- Закрытие позиции ---
             if stats["in_position"]:
                 side = stats["side"]
                 is_tp = (side == "BUY" and curr_p >= stats["tp"]) or (side == "SELL" and curr_p <= stats["tp"])
                 is_sl = (side == "BUY" and curr_p <= stats["sl"]) or (side == "SELL" and curr_p >= stats["sl"])
 
                 if is_tp or is_sl:
-                    res = REWARD_USD if is_tp else -RISK_USD
+                    res = (RISK_USD * RR) if is_tp else -RISK_USD
                     fee = (stats["qty"] * curr_p * COMMISSION_RATE) * 2
                     stats["balance"] += (res - fee)
                     stats["total_fees"] += fee
@@ -73,50 +65,27 @@ def bot_worker():
                     stats["in_position"] = False
 
                     msg = "✅ ПРОФИТ" if is_tp else "❌ СТОП"
-                    send_tg(f"{msg}\nБаланс: *{round(stats['balance'], 2)}$*\n{stats['wins']}W - {stats['losses']}L")
-                    time.sleep(10)
+                    send_tg(f"{msg}\nБаланс: *{round(stats['balance'],2)}$*\n{stats['wins']}W - {stats['losses']}L")
+                    time.sleep(5)
 
-            # --- ПОИСК ВХОДА ---
+            # --- Случайный вход 1/3 ---
             else:
-                df, h, l = get_channel_extrema()
-                if h and l:
-                    # считаём касания
-                    if curr_p >= h * (1 - TOUCH_TOLERANCE):
-                        if last_touch_side != "HIGH":
-                            touches_high += 1
-                            last_touch_side = "HIGH"
+                if random.random() < 1/3:
+                    side = random.choice(["BUY","SELL"])
+                    stop_dist = curr_p * STOP_PERCENT
+                    stats["qty"] = RISK_USD / stop_dist
+                    stats["side"] = side
 
-                    elif curr_p <= l * (1 + TOUCH_TOLERANCE):
-                        if last_touch_side != "LOW":
-                            touches_low += 1
-                            last_touch_side = "LOW"
+                    if side == "BUY":
+                        stats["sl"], stats["tp"] = curr_p - stop_dist, curr_p + stop_dist*RR
+                    else:
+                        stats["sl"], stats["tp"] = curr_p + stop_dist, curr_p - stop_dist*RR
 
-                    side = None
-
-                    # третье касание + отказ от пробоя
-                    if touches_high >= 3 and curr_p < h:
-                        side = "SELL"
-                        touches_high = 0
-
-                    elif touches_low >= 3 and curr_p > l:
-                        side = "BUY"
-                        touches_low = 0
-
-                    if side:
-                        stop_dist = curr_p * 0.005
-                        stats["qty"] = RISK_USD / stop_dist
-                        stats["side"] = side
-
-                        if side == "BUY":
-                            stats["sl"], stats["tp"] = curr_p - stop_dist, curr_p + stop_dist * 3
-                        else:
-                            stats["sl"], stats["tp"] = curr_p + stop_dist, curr_p - stop_dist * 3
-
-                        stats["in_position"] = True
-                        send_tg(f"🚀 *ВХОД 1:3 ({side})*\nЦена: `{curr_p}`\nTP: `{round(stats['tp'], 2)}`")
+                    stats["in_position"] = True
+                    send_tg(f"🎲 Мини-вход: {side}\nЦена: {curr_p}\nTP: {round(stats['tp'],2)} | SL: {round(stats['sl'],2)}")
 
         except Exception:
-            time.sleep(10)
+            time.sleep(5)
 
         time.sleep(10)
 
