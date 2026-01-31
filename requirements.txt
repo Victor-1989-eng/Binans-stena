@@ -1,6 +1,6 @@
+pyTelegramBotAPI
 python-binance
 flask
-requests
-gunicorn
 numpy
-pyTelegramBotAPI
+pandas
+gunicorn
