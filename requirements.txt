@@ -1,6 +1,6 @@
-pandas. pd
-python-binance
-flask
-pandas
-gunicorn
 ccxt
+pandas
+requests
+flask
+numpy
+
