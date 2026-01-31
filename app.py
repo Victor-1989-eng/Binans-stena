@@ -4,6 +4,7 @@ import threading
 import ccxt
 import requests
 import random
+import pandas as pd
 from flask import Flask
 
 app = Flask(__name__)
@@ -14,6 +15,7 @@ RISK_USD = 5.0        # маленький риск на сделку
 COMMISSION_RATE = 0.0004
 STOP_PERCENT = 0.005   # 0.5%
 RR = 3                 # тейк = стоп * 3
+EMA_PERIOD = 10        # период EMA для тренда
 
 stats = {
     "balance": 1000.0,
@@ -43,10 +45,11 @@ def send_tg(text):
 
 def bot_worker():
     global stats
-    send_tg("🎲 *МИНИ-РУЛЕТКА 1:3 ЗАПУЩЕНА*\nРиск на сделку 5$ | Стоп 0.5% | TP ×3 | Вход случайный 1/3")
+    send_tg("🎲 *МИНИ-РУЛЕТКА 1:3 + ТРЕНД ЗАПУЩЕНА*\nРиск на сделку 5$ | Стоп 0.5% | TP ×3 | Вход случайный 1/3 с фильтром EMA10")
 
     while True:
         try:
+            # текущая цена
             curr_p = exchange.fetch_ticker(SYMBOL)['last']
 
             # --- Закрытие позиции ---
@@ -68,10 +71,20 @@ def bot_worker():
                     send_tg(f"{msg}\nБаланс: *{round(stats['balance'],2)}$*\n{stats['wins']}W - {stats['losses']}L")
                     time.sleep(5)
 
-            # --- Случайный вход 1/3 ---
+            # --- Случайный вход 1/3 с фильтром EMA10 ---
             else:
                 if random.random() < 1/3:
-                    side = random.choice(["BUY","SELL"])
+                    # получаем последние свечи
+                    bars = exchange.fetch_ohlcv(SYMBOL, '1m', limit=EMA_PERIOD+1)
+                    df = pd.DataFrame(bars, columns=['ts','o','h','l','c','v'])
+                    ema10 = df['c'].ewm(span=EMA_PERIOD).mean().iloc[-1]
+
+                    # фильтр по тренду
+                    if curr_p > ema10:
+                        side = "BUY"  # тренд вверх
+                    else:
+                        side = "SELL" # тренд вниз
+
                     stop_dist = curr_p * STOP_PERCENT
                     stats["qty"] = RISK_USD / stop_dist
                     stats["side"] = side
@@ -82,7 +95,7 @@ def bot_worker():
                         stats["sl"], stats["tp"] = curr_p + stop_dist, curr_p - stop_dist*RR
 
                     stats["in_position"] = True
-                    send_tg(f"🎲 Мини-вход: {side}\nЦена: {curr_p}\nTP: {round(stats['tp'],2)} | SL: {round(stats['sl'],2)}")
+                    send_tg(f"🎲 Мини-вход с трендом: {side}\nЦена: {curr_p}\nTP: {round(stats['tp'],2)} | SL: {round(stats['sl'],2)}")
 
         except Exception:
             time.sleep(5)
