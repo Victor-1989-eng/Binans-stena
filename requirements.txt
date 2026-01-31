@@ -2,3 +2,4 @@ ccxt
 pandas
 requests
 flask
+gunicorn
