@@ -1,4 +1,4 @@
-pandas pd
+pandas. pd
 python-binance
 flask
 pandas
