@@ -3,7 +3,7 @@ from telebot import types
 from flask import Flask
 from datetime import datetime
 
-# --- [КОНФИГ] ---
+# --- [КОНФИГ СНАЙПЕРА] ---
 SYMBOLS = ['BNB/USDC', 'ETH/USDC', 'SOL/USDC', 'BTC/USDC', 'DOGE/USDC']
 RISK_USD = 5.0
 RR = 3
@@ -14,40 +14,55 @@ EMA_PERIOD = 30
 MIN_EDGE = 0.33
 MIN_SAMPLES = 2
 
-# --- [ГЛОБАЛЬНЫЕ ДАННЫЕ] ---
-stats = {"balance": 1000.0, "wins": 0, "losses": 0}
-active_trades = [] 
-cond_stats = {} 
+# --- [ID КАНАЛА ДЛЯ ПАМЯТИ] ---
+# Замени на ID своего канала, чтобы память была в отдельном месте
+BACKUP_CHAT_ID = os.environ.get("CHAT_ID") 
 
+# --- [ДАННЫЕ] ---
 TOKEN = os.environ.get("TELEGRAM_TOKEN")
 CHAT_ID = os.environ.get("CHAT_ID")
-MODE = "paper" 
-RUNNING = True
 
 bot = telebot.TeleBot(TOKEN)
 exchange = ccxt.binance({'options': {'defaultType': 'future'}})
 app = Flask(__name__)
 
-# --- [ЛОГИКА ПАМЯТИ] ---
-def save_brain():
-    """Сохраняет мозг в чат, чтобы не забыть при деплое"""
-    try:
-        if not cond_stats: return
-        data = {"stats": stats, "cond_stats": cond_stats}
-        bot.send_message(CHAT_ID, f"#BACKUP\n{json.dumps(data)}")
-    except: pass
+stats = {"balance": 1000.0, "wins": 0, "losses": 0}
+cond_stats = {}
+active_trades = []
+RUNNING = True
+MODE = "paper"
 
-def load_brain():
-    """Попытка восстановить данные из истории сообщений"""
-    global cond_stats, stats
+# --- [ФУНКЦИИ ПАМЯТИ] ---
+
+def save_memory():
+    """Отправка слепка данных в Telegram"""
     try:
-        # В бесплатном API телеграм сложно достать историю, 
-        # поэтому при старте просто ждем новое сохранение или работаем с нуля.
-        # Если у тебя есть доступ к сообщениям, можно настроить чтение.
-        pass
-    except: pass
+        data = {"stats": stats, "cond_stats": cond_stats}
+        bot.send_message(BACKUP_CHAT_ID, f"#BACKUP\n{json.dumps(data)}")
+    except Exception as e:
+        print(f"Ошибка сохранения: {e}")
+
+def load_memory():
+    """Автоматическое восстановление при старте"""
+    global stats, cond_stats
+    try:
+        print("🔄 Поиск бэкапа...")
+        # Метод get_chat_history работает в личке или если бот админ в канале
+        messages = bot.get_chat_history(BACKUP_CHAT_ID, limit=100)
+        for msg in messages:
+            if msg.text and msg.text.startswith("#BACKUP"):
+                raw_data = msg.text.replace("#BACKUP\n", "")
+                data = json.loads(raw_data)
+                stats = data.get("stats", stats)
+                cond_stats = data.get("cond_stats", cond_stats)
+                bot.send_message(CHAT_ID, f"🧠 **Память восстановлена!**\nЗагружено паттернов: {len(cond_stats)}")
+                return True
+    except Exception as e:
+        print(f"Ошибка загрузки: {e}")
+    return False
 
 # --- [ИНТЕРФЕЙС] ---
+
 def get_main_menu():
     markup = types.InlineKeyboardMarkup(row_width=2)
     markup.add(
@@ -59,10 +74,6 @@ def get_main_menu():
         types.InlineKeyboardButton("📊 БАЛАНС", callback_data="balance")
     )
     return markup
-
-@bot.message_handler(commands=['start'])
-def welcome(message):
-    bot.send_message(message.chat.id, "🎯 Sniper v10.35 готов к охоте!", reply_markup=get_main_menu())
 
 @bot.callback_query_handler(func=lambda call: True)
 def callback_query(call):
@@ -82,16 +93,24 @@ def callback_query(call):
             total = v['W'] + v['L'] + v['T']
             avg_t = round(v['total_time'] / total, 1) if total > 0 else 0
             wr = round(v['W'] / (v['W'] + v['L']) * 100, 1) if (v['W'] + v['L']) > 0 else 0
-            res += f"● `{k}`\n   └ Win: {wr}% | ⏱ {avg_t} мин.\n"
+            res += f"● `{k}`\n   └ WR: {wr}% | ⏱ {avg_t} мин.\n"
         bot.send_message(CHAT_ID, res, reply_markup=get_main_menu())
     bot.answer_callback_query(call.id, f"Ок: {call.data}")
 
-# --- [ЯДРО] ---
+# --- [ЛОГИКА ТОРГОВЛИ] ---
+
+def calculate_rsi(series, period=14):
+    delta = series.diff()
+    gain = (delta.where(delta > 0, 0)).rolling(window=period).mean()
+    loss = (-delta.where(delta < 0, 0)).rolling(window=period).mean()
+    rs = gain / loss
+    return 100 - (100 / (1 + rs))
+
 def bot_worker():
     global stats, active_trades
     while True:
         if RUNNING:
-            # ПРОВЕРКА ВЫХОДА
+            # 1. ПРОВЕРКА ВЫХОДА
             for trade in active_trades[:]:
                 try:
                     ticker = exchange.fetch_ticker(trade["sym"])
@@ -129,10 +148,10 @@ def bot_worker():
                         stats["balance"] += res_usd
                         active_trades.remove(trade)
                         bot.send_message(CHAT_ID, f"{txt}\n💰 Итог: {round(res_usd, 2)}$\n📊 Баланс: {round(stats['balance'], 2)}$", reply_markup=get_main_menu())
-                        save_brain() # Сохраняем после каждой сделки
+                        save_memory() # Сохраняем после каждой закрытой сделки
                 except: pass
 
-            # ПОИСК ВХОДА
+            # 2. ПОИСК ВХОДА
             trade_limit = 5 if MODE == "paper" else 1
             if len(active_trades) < trade_limit:
                 for sym in SYMBOLS:
@@ -168,14 +187,18 @@ def bot_worker():
                                 "tp": round(curr + stop*RR if direction=="ВВЕРХ" else curr - stop*RR, 4),
                                 "key": key, "start_time": datetime.now(), "be_active": False
                             })
-                            bot.send_message(CHAT_ID, f"🎯 **ВХОД {sym}**\n💵 Цена: `{curr}`\n🔑 Ключ: `{key}`", reply_markup=get_main_menu())
+                            bot.send_message(CHAT_ID, f"🎯 **ВХОД {sym}**\nЦена: `{curr}`\n🔑: `{key}`", reply_markup=get_main_menu())
                     except: continue
         time.sleep(15)
 
 @app.route('/')
-def home(): return "Sniper v10.35 OK", 200
+def home(): return "Sniper v10.40 LifeCycle OK", 200
 
 if __name__ == "__main__":
+    # Загружаем память при старте
+    load_memory()
+    
+    # Запуск бота
     threading.Thread(target=bot_worker, daemon=True).start()
     threading.Thread(target=lambda: bot.infinity_polling(), daemon=True).start()
     app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 10000)))
