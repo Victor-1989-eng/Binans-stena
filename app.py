@@ -3,7 +3,7 @@ from telebot import types
 from flask import Flask
 from datetime import datetime
 
-# --- [КОНФИГ И ПЕРЕМЕННЫЕ] ---
+# --- [КОНФИГ СНАЙПЕРА - ВСЕ ПАРАМЕТРЫ НА МЕСТЕ] ---
 SYMBOLS = ['BNB/USDC', 'ETH/USDC', 'SOL/USDC', 'BTC/USDC', 'DOGE/USDC']
 RISK_USD = 5.0
 RR = 3
@@ -11,8 +11,8 @@ STOP_PCT = 0.005
 BE_THRESHOLD = 0.003
 TIME_LIMIT = 20
 EMA_PERIOD = 30
-MIN_EDGE = 0.33
-MIN_SAMPLES = 2
+MIN_EDGE = 0.33      # Минимальный винрейт для входа
+MIN_SAMPLES = 2      # Минимум сделок для учета статистики
 
 TOKEN = os.environ.get("TELEGRAM_TOKEN")
 CHAT_ID = os.environ.get("CHAT_ID")
@@ -29,21 +29,15 @@ RUNNING = True
 MODE = "paper"
 
 # --- [ЛОГИКА ПАМЯТИ] ---
-
 def save_memory():
-    """Отправляет бэкап в технический канал"""
     try:
-        if not cond_stats: return
         data = {"stats": stats, "cond_stats": cond_stats}
         bot.send_message(BACKUP_CHAT_ID, f"#BACKUP\n{json.dumps(data)}")
-    except Exception as e:
-        print(f"Ошибка сохранения в канал: {e}")
+    except: pass
 
 def load_memory():
-    """Восстанавливает мозг из технического канала при старте"""
     global stats, cond_stats
     try:
-        # Пытаемся прочитать историю из BACKUP_CHAT_ID
         messages = bot.get_chat_history(BACKUP_CHAT_ID, limit=50)
         for msg in messages:
             if msg.text and msg.text.startswith("#BACKUP"):
@@ -51,21 +45,17 @@ def load_memory():
                 data = json.loads(raw_data)
                 stats = data.get("stats", stats)
                 cond_stats = data.get("cond_stats", cond_stats)
-                bot.send_message(CHAT_ID, f"🧠 Память успешно загружена из архива!")
+                bot.send_message(CHAT_ID, f"🧠 Память восстановлена! Паттернов: {len(cond_stats)}")
                 return True
-    except Exception as e:
-        bot.send_message(CHAT_ID, "⚠️ Не удалось загрузить память автоматически.")
+    except: pass
     return False
 
 # --- [ИНТЕРФЕЙС] ---
-
 def get_main_menu():
     markup = types.InlineKeyboardMarkup(row_width=2)
     markup.add(
         types.InlineKeyboardButton("🚀 СТАРТ", callback_data="start"),
         types.InlineKeyboardButton("⏸ СТОП", callback_data="stop"),
-        types.InlineKeyboardButton("📝 БУМАГА", callback_data="paper"),
-        types.InlineKeyboardButton("💰 LIVE", callback_data="live"),
         types.InlineKeyboardButton("🧠 МОЗГ", callback_data="stats"),
         types.InlineKeyboardButton("📊 БАЛАНС", callback_data="balance")
     )
@@ -73,60 +63,57 @@ def get_main_menu():
 
 @bot.message_handler(commands=['start', 'menu'])
 def send_menu(message):
-    bot.send_message(message.chat.id, "🎮 Панель управления:", reply_markup=get_main_menu())
+    bot.send_message(message.chat.id, "🎯 Sniper v10.55 | Режим: " + MODE.upper(), reply_markup=get_main_menu())
 
 @bot.callback_query_handler(func=lambda call: True)
 def callback_query(call):
-    global MODE, RUNNING
-    if call.data == "paper": MODE = "paper"
-    elif call.data == "live": MODE = "live"
-    elif call.data == "start": RUNNING = True
+    global RUNNING
+    if call.data == "start": RUNNING = True
     elif call.data == "stop": RUNNING = False
     elif call.data == "balance":
-        bot.send_message(CHAT_ID, f"📊 Баланс: `{round(stats['balance'], 2)}$` | Сделок: {len(active_trades)}")
+        bot.send_message(CHAT_ID, f"📊 Баланс: `{round(stats['balance'], 2)}$` | Открыто: {len(active_trades)}")
     elif call.data == "stats":
-        if not cond_stats:
-            bot.send_message(CHAT_ID, "🧠 Мозг пуст...")
-            return
+        if not cond_stats: bot.send_message(CHAT_ID, "🧠 Мозг пуст."); return
         res = "🧠 **АНАЛИЗ ПАТТЕРНОВ:**\n"
-        for k, v in cond_stats.items():
+        # Показываем только те, где есть хоть какой-то результат
+        for k, v in list(cond_stats.items())[-10:]:
             total = v['W'] + v['L'] + v['T']
             wr = round(v['W'] / (v['W'] + v['L']) * 100, 1) if (v['W'] + v['L']) > 0 else 0
-            res += f"● `{k}`: {wr}% WR | ⏱ {round(v['total_time']/total, 1)} мин.\n"
+            res += f"● `{k}`: {wr}% WR | {total} поп.\n"
         bot.send_message(CHAT_ID, res)
-    bot.answer_callback_query(call.id, "Выполнено")
+    bot.answer_callback_query(call.id)
 
-# --- [ТОРГОВОЕ ЯДРО] ---
-
+# --- [МАТЕМАТИКА] ---
 def calculate_rsi(series, period=14):
     delta = series.diff()
-    g = (delta.where(delta > 0, 0)).rolling(period).mean()
-    l = (-delta.where(delta < 0, 0)).rolling(period).mean()
-    rs = g / l
+    gain = (delta.where(delta > 0, 0)).rolling(period).mean()
+    loss = (-delta.where(delta < 0, 0)).rolling(period).mean()
+    rs = gain / loss
     return 100 - (100 / (1 + rs))
 
 def bot_worker():
     global stats, active_trades
     while True:
         if RUNNING:
-            # ПРОВЕРКА ОТКРЫТЫХ ПОЗИЦИЙ
+            # 1. ПРОВЕРКА ВЫХОДА
             for trade in active_trades[:]:
                 try:
                     ticker = exchange.fetch_ticker(trade["sym"])
                     curr = ticker['last']
                     elapsed = (datetime.now() - trade["start_time"]).total_seconds() / 60
                     
-                    # Безубыток
                     if not trade["be_active"]:
                         dist = (curr - trade["entry"]) / trade["entry"] if trade["side"] == "BUY" else (trade["entry"] - curr) / trade["entry"]
                         if dist >= BE_THRESHOLD:
-                            trade["sl"] = trade["entry"]
-                            trade["be_active"] = True
+                            trade["sl"] = trade["entry"]; trade["be_active"] = True
                             bot.send_message(CHAT_ID, f"🛡 БЕЗУБЫТОК {trade['sym']}")
 
                     hit_tp = (trade["side"] == "BUY" and curr >= trade["tp"]) or (trade["side"] == "SELL" and curr <= trade["tp"])
                     hit_sl = (trade["side"] == "BUY" and curr <= trade["sl"]) or (trade["side"] == "SELL" and curr >= trade["sl"])
-                    timeout = elapsed >= TIME_LIMIT
+                    
+                    # УМНЫЙ ТАЙМ-АУТ (v10.50+)
+                    is_in_profit = (trade["side"] == "BUY" and curr > trade["entry"]) or (trade["side"] == "SELL" and curr < trade["entry"])
+                    timeout = (elapsed >= TIME_LIMIT) and not is_in_profit
 
                     if hit_tp or hit_sl or timeout:
                         res_usd = 0; res_type = ""
@@ -134,8 +121,7 @@ def bot_worker():
                         elif hit_sl: res_usd = 0 if trade["be_active"] else -RISK_USD; res_type = "loss"; txt = f"❌ СТОП {trade['sym']}"
                         else:
                             pnl = (curr - trade["entry"]) / trade["entry"] if trade["side"] == "BUY" else (trade["entry"] - curr) / trade["entry"]
-                            res_usd = (pnl / STOP_PCT) * RISK_USD
-                            res_type = "timeout"; txt = f"⏰ ТАЙМ-АУТ {trade['sym']}"
+                            res_usd = (pnl / STOP_PCT) * RISK_USD; res_type = "timeout"; txt = f"⏰ ТАЙМ-АУТ {trade['sym']}"
 
                         k = trade["key"]; cond_stats.setdefault(k, {"W":0, "L":0, "T":0, "total_time": 0})
                         if res_type == "win": cond_stats[k]["W"] += 1
@@ -145,50 +131,48 @@ def bot_worker():
                         
                         stats["balance"] += res_usd
                         active_trades.remove(trade)
-                        bot.send_message(CHAT_ID, f"{txt}\n💰 Итог: {round(res_usd, 2)}$\n📊 Баланс: {round(stats['balance'], 2)}$")
-                        save_memory() # Летит в BACKUP_CHAT_ID
+                        bot.send_message(CHAT_ID, f"{txt}\n💰 {round(res_usd, 2)}$ | Бал: {round(stats['balance'], 2)}$")
+                        save_memory()
                 except: pass
 
-            # ПОИСК НОВЫХ ВХОДОВ
-            trade_limit = 5 if MODE == "paper" else 1
-            if len(active_trades) < trade_limit:
+            # 2. ПОИСК ВХОДА (С ФИЛЬТРОМ ОПЫТА)
+            if len(active_trades) < 5:
                 for sym in SYMBOLS:
                     if any(t["sym"] == sym for t in active_trades): continue
-                    if len(active_trades) >= trade_limit: break
                     try:
                         bars = exchange.fetch_ohlcv(sym, '1m', limit=50)
                         df = pd.DataFrame(bars, columns=['ts','o','h','l','c','v'])
                         curr = df['c'].iloc[-1]
                         df['ema'] = df['c'].ewm(span=EMA_PERIOD).mean()
                         df['rsi'] = calculate_rsi(df['c'])
-                        ema = df['ema'].iloc[-1]
+                        ema, rsi = df['ema'].iloc[-1], df['rsi'].iloc[-1]
                         
-                        direction = "ВВЕРХ" if curr > ema else "ВНИЗ" if curr < ema else None
-                        if direction:
-                            f_imp = "Имп" if abs(curr-ema)/ema >= 0.002 else "Вяло"
-                            key = f"{sym.split('/')[0]}_{direction}_{f_imp}_{datetime.utcnow().hour}"
-                            
-                            # Фильтр опыта
-                            rec = cond_stats.get(key, {"W":0, "L":0})
-                            if (rec["W"]+rec["L"]) >= MIN_SAMPLES and (rec["W"]/(rec["W"]+rec["L"])) < MIN_EDGE: continue
+                        direction = "ВВЕРХ" if curr > ema else "ВНИЗ"
+                        f_imp = "Имп" if abs(curr-ema)/ema >= 0.002 else "Вяло"
+                        key = f"{sym.split('/')[0]}_{direction}_{f_imp}_{datetime.utcnow().hour}"
+                        
+                        # --- ФИЛЬТР МОЗГА (ТОТ САМЫЙ!) ---
+                        rec = cond_stats.get(key, {"W":0, "L":0})
+                        if (rec["W"] + rec["L"]) >= MIN_SAMPLES:
+                            winrate = rec["W"] / (rec["W"] + rec["L"])
+                            if winrate < MIN_EDGE: continue # Пропускаем плохой паттерн
 
-                            stop = curr * STOP_PCT
-                            active_trades.append({
-                                "sym": sym, "side": "BUY" if direction=="ВВЕРХ" else "SELL",
-                                "entry": curr, 
-                                "sl": round(curr - stop if direction=="ВВЕРХ" else curr + stop, 4),
-                                "tp": round(curr + stop*RR if direction=="ВВЕРХ" else curr - stop*RR, 4),
-                                "key": key, "start_time": datetime.now(), "be_active": False
-                            })
-                            bot.send_message(CHAT_ID, f"🎯 **ВХОД {sym}**\nЦена: `{curr}`\n🔑: `{key}`")
+                        stop = curr * STOP_PCT
+                        active_trades.append({
+                            "sym": sym, "side": "BUY" if direction=="ВВЕРХ" else "SELL", "entry": curr,
+                            "sl": round(curr - stop if direction=="ВВЕРХ" else curr + stop, 4),
+                            "tp": round(curr + stop*RR if direction=="ВВЕРХ" else curr - stop*RR, 4),
+                            "key": key, "start_time": datetime.now(), "be_active": False
+                        })
+                        bot.send_message(CHAT_ID, f"🎯 ВХОД {sym}\n🔑 {key}")
                     except: continue
         time.sleep(15)
 
 @app.route('/')
-def home(): return "Sniper v10.46 Hybrid OK", 200
+def home(): return "v10.55 Final Hybrid OK", 200
 
 if __name__ == "__main__":
-    load_memory() # Вспоминаем старое из канала
+    load_memory()
     threading.Thread(target=bot_worker, daemon=True).start()
     threading.Thread(target=lambda: bot.infinity_polling(), daemon=True).start()
     app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 10000)))
