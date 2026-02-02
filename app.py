@@ -1,23 +1,23 @@
-import os, time, threading, pandas as pd, ccxt, telebot
+import os, time, threading, pandas as pd, ccxt, telebot, json
 from telebot import types
 from flask import Flask
-from datetime import datetime, timedelta
+from datetime import datetime
 
-# --- [КОНФИГ СНАЙПЕРА] ---
+# --- [КОНФИГ] ---
 SYMBOLS = ['BNB/USDC', 'ETH/USDC', 'SOL/USDC', 'BTC/USDC', 'DOGE/USDC']
 RISK_USD = 5.0
 RR = 3
 STOP_PCT = 0.005
-BE_THRESHOLD = 0.003  # Безубыток после +0.3% прибыли
-TIME_LIMIT = 20       # Жесткий лимит 20 минут
+BE_THRESHOLD = 0.003
+TIME_LIMIT = 20
 EMA_PERIOD = 30
-MIN_EDGE = 0.33       # Минимум 33% винрейта для входа
-MIN_SAMPLES = 2       # Нужно минимум 2 сделки для оценки опыта
+MIN_EDGE = 0.33
+MIN_SAMPLES = 2
 
 # --- [ГЛОБАЛЬНЫЕ ДАННЫЕ] ---
 stats = {"balance": 1000.0, "wins": 0, "losses": 0}
 active_trades = [] 
-cond_stats = {} # Память времени и профита
+cond_stats = {} 
 
 TOKEN = os.environ.get("TELEGRAM_TOKEN")
 CHAT_ID = os.environ.get("CHAT_ID")
@@ -28,21 +28,26 @@ bot = telebot.TeleBot(TOKEN)
 exchange = ccxt.binance({'options': {'defaultType': 'future'}})
 app = Flask(__name__)
 
-# --- [ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ] ---
-def get_session():
-    h = datetime.utcnow().hour
-    if 0 <= h < 6: return "Ночь"
-    if 6 <= h < 12: return "Утро"
-    if 12 <= h < 18: return "День"
-    return "Вечер"
+# --- [ЛОГИКА ПАМЯТИ] ---
+def save_brain():
+    """Сохраняет мозг в чат, чтобы не забыть при деплое"""
+    try:
+        if not cond_stats: return
+        data = {"stats": stats, "cond_stats": cond_stats}
+        bot.send_message(CHAT_ID, f"#BACKUP\n{json.dumps(data)}")
+    except: pass
 
-def calculate_rsi(series, period=14):
-    delta = series.diff()
-    gain = (delta.where(delta > 0, 0)).rolling(window=period).mean()
-    loss = (-delta.where(delta < 0, 0)).rolling(window=period).mean()
-    rs = gain / loss
-    return 100 - (100 / (1 + rs))
+def load_brain():
+    """Попытка восстановить данные из истории сообщений"""
+    global cond_stats, stats
+    try:
+        # В бесплатном API телеграм сложно достать историю, 
+        # поэтому при старте просто ждем новое сохранение или работаем с нуля.
+        # Если у тебя есть доступ к сообщениям, можно настроить чтение.
+        pass
+    except: pass
 
+# --- [ИНТЕРФЕЙС] ---
 def get_main_menu():
     markup = types.InlineKeyboardMarkup(row_width=2)
     markup.add(
@@ -55,7 +60,10 @@ def get_main_menu():
     )
     return markup
 
-# --- [ОБРАБОТКА ТЕЛЕГРАМ] ---
+@bot.message_handler(commands=['start'])
+def welcome(message):
+    bot.send_message(message.chat.id, "🎯 Sniper v10.35 готов к охоте!", reply_markup=get_main_menu())
+
 @bot.callback_query_handler(func=lambda call: True)
 def callback_query(call):
     global MODE, RUNNING
@@ -64,41 +72,39 @@ def callback_query(call):
     elif call.data == "start": RUNNING = True
     elif call.data == "stop": RUNNING = False
     elif call.data == "balance":
-        bot.send_message(CHAT_ID, f"📊 Баланс: `{round(stats['balance'], 2)}$` | Активных: {len(active_trades)}")
+        bot.send_message(CHAT_ID, f"📊 Баланс: `{round(stats['balance'], 2)}$` | Сделок: {len(active_trades)}", reply_markup=get_main_menu())
     elif call.data == "stats":
         if not cond_stats:
-            bot.send_message(CHAT_ID, "🧠 Мозг пока пуст...")
+            bot.send_message(CHAT_ID, "🧠 Мозг пуст...", reply_markup=get_main_menu())
             return
-        res = "🧠 **Анализ Снайпера:**\n\n"
+        res = "🧠 **АНАЛИЗ ПАТТЕРНОВ:**\n\n"
         for k, v in cond_stats.items():
             total = v['W'] + v['L'] + v['T']
             avg_t = round(v['total_time'] / total, 1) if total > 0 else 0
             wr = round(v['W'] / (v['W'] + v['L']) * 100, 1) if (v['W'] + v['L']) > 0 else 0
             res += f"● `{k}`\n   └ Win: {wr}% | ⏱ {avg_t} мин.\n"
-        bot.send_message(CHAT_ID, res)
+        bot.send_message(CHAT_ID, res, reply_markup=get_main_menu())
     bot.answer_callback_query(call.id, f"Ок: {call.data}")
 
-# --- [ЯДРО БОТА] ---
+# --- [ЯДРО] ---
 def bot_worker():
     global stats, active_trades
     while True:
         if RUNNING:
-            # 1. ПРОВЕРКА ВЫХОДА
+            # ПРОВЕРКА ВЫХОДА
             for trade in active_trades[:]:
                 try:
                     ticker = exchange.fetch_ticker(trade["sym"])
                     curr = ticker['last']
                     elapsed = (datetime.now() - trade["start_time"]).total_seconds() / 60
                     
-                    # Логика БЕЗУБЫТКА
                     if not trade["be_active"]:
                         dist = (curr - trade["entry"]) / trade["entry"] if trade["side"] == "BUY" else (trade["entry"] - curr) / trade["entry"]
                         if dist >= BE_THRESHOLD:
                             trade["sl"] = trade["entry"]
                             trade["be_active"] = True
-                            bot.send_message(CHAT_ID, f"🛡 **БЕЗУБЫТОК** для {trade['sym']}")
+                            bot.send_message(CHAT_ID, f"🛡 **БЕЗУБЫТОК** {trade['sym']}")
 
-                    # Условия завершения
                     hit_tp = (trade["side"] == "BUY" and curr >= trade["tp"]) or (trade["side"] == "SELL" and curr <= trade["tp"])
                     hit_sl = (trade["side"] == "BUY" and curr <= trade["sl"]) or (trade["side"] == "SELL" and curr >= trade["sl"])
                     timeout = elapsed >= TIME_LIMIT
@@ -106,46 +112,34 @@ def bot_worker():
                     if hit_tp or hit_sl or timeout:
                         res_usd = 0
                         res_type = ""
-                        
-                        if hit_tp:
-                            res_usd = RISK_USD * RR
-                            res_type = "win"
-                            txt = f"✅ ПРОФИТ {trade['sym']}"
-                        elif hit_sl:
-                            # Если сработал БУ, убыток 0
-                            res_usd = 0 if trade["be_active"] else -RISK_USD
-                            res_type = "loss"
-                            txt = f"❌ СТОП {trade['sym']}"
+                        if hit_tp: res_usd = RISK_USD * RR; res_type = "win"; txt = f"✅ ПРОФИТ {trade['sym']}"
+                        elif hit_sl: res_usd = 0 if trade["be_active"] else -RISK_USD; res_type = "loss"; txt = f"❌ СТОП {trade['sym']}"
                         else:
-                            # Закрытие по времени (считаем разницу)
-                            pnl_pct = (curr - trade["entry"]) / trade["entry"] if trade["side"] == "BUY" else (trade["entry"] - curr) / trade["entry"]
-                            res_usd = (pnl_pct / STOP_PCT) * RISK_USD
-                            res_type = "timeout"
-                            txt = f"⏰ ТАЙМ-АУТ {trade['sym']}"
+                            pnl = (curr - trade["entry"]) / trade["entry"] if trade["side"] == "BUY" else (trade["entry"] - curr) / trade["entry"]
+                            res_usd = (pnl / STOP_PCT) * RISK_USD
+                            res_type = "timeout"; txt = f"⏰ ТАЙМ-АУТ {trade['sym']}"
 
-                        # Запись в Мозг
                         k = trade["key"]
                         if k not in cond_stats: cond_stats[k] = {"W":0, "L":0, "T":0, "total_time": 0}
-                        if res_type == "win": cond_stats[k]["W"] += 1; stats["wins"] += 1
-                        elif res_type == "loss": cond_stats[k]["L"] += 1; stats["losses"] += 1
+                        if res_type == "win": cond_stats[k]["W"] += 1
+                        elif res_type == "loss": cond_stats[k]["L"] += 1
                         else: cond_stats[k]["T"] += 1
                         cond_stats[k]["total_time"] += elapsed
 
                         stats["balance"] += res_usd
                         active_trades.remove(trade)
-                        bot.send_message(CHAT_ID, f"{txt}\n💰 Итог: {round(res_usd, 2)}$\n📊 Баланс: {round(stats['balance'], 2)}$")
-                except Exception as e: print(f"Ошибка выхода: {e}")
+                        bot.send_message(CHAT_ID, f"{txt}\n💰 Итог: {round(res_usd, 2)}$\n📊 Баланс: {round(stats['balance'], 2)}$", reply_markup=get_main_menu())
+                        save_brain() # Сохраняем после каждой сделки
+                except: pass
 
-            # 2. ПОИСК ВХОДА
-            # Лимит: 5 сделок для Бумаги, 1 сделка для Live
+            # ПОИСК ВХОДА
             trade_limit = 5 if MODE == "paper" else 1
             if len(active_trades) < trade_limit:
                 for sym in SYMBOLS:
                     if any(t["sym"] == sym for t in active_trades): continue
                     if len(active_trades) >= trade_limit: break
-                    
                     try:
-                        bars = exchange.fetch_ohlcv(sym, '1m', limit=100)
+                        bars = exchange.fetch_ohlcv(sym, '1m', limit=50)
                         df = pd.DataFrame(bars, columns=['ts','o','h','l','c','v'])
                         curr = df['c'].iloc[-1]
                         df['ema'] = df['c'].ewm(span=EMA_PERIOD).mean()
@@ -155,38 +149,31 @@ def bot_worker():
                         df['range_ema'] = df['range'].rolling(20).mean()
 
                         ema, rsi = df['ema'].iloc[-1], df['rsi'].iloc[-1]
-                        vol_now, vol_avg = df['v'].iloc[-1], df['vol_ema'].iloc[-1]
-                        range_now, range_avg = df['range'].iloc[-1], df['range_ema'].iloc[-1]
-
                         direction = "ВВЕРХ" if curr > ema else "ВНИЗ" if curr < ema else None
+                        
                         if direction:
                             f_imp = "Имп" if abs(curr-ema)/ema >= 0.002 else "Вяло"
-                            f_vol = "Вол" if range_now > range_avg else "Штиль"
-                            f_mon = "Объем" if vol_now > vol_avg else "Пусто"
+                            f_vol = "Вол" if (df['range'].iloc[-1] > df['range_ema'].iloc[-1]) else "Штиль"
+                            f_mon = "Объем" if (df['v'].iloc[-1] > df['vol_ema'].iloc[-1]) else "Пусто"
                             f_rsi = "Перегрев" if (direction=="ВВЕРХ" and rsi > 70) or (direction=="ВНИЗ" and rsi < 30) else "Сила"
+                            key = f"{sym.split('/')[0]}_{direction}_{f_imp}_{f_vol}_{datetime.utcnow().hour}_{f_mon}_{f_rsi}"
                             
-                            key = f"{sym.split('/')[0]}_{direction}_{f_imp}_{f_vol}_{get_session()}_{f_mon}_{f_rsi}"
-                            
-                            # Проверка фильтра Мозга
-                            rec = cond_stats.get(key, {"W":0, "L":0, "T":0})
-                            total = rec["W"] + rec["L"]
-                            if total >= MIN_SAMPLES and (rec["W"]/total) < MIN_EDGE: continue
+                            rec = cond_stats.get(key, {"W":0, "L":0})
+                            if (rec["W"]+rec["L"]) >= MIN_SAMPLES and (rec["W"]/(rec["W"]+rec["L"])) < MIN_EDGE: continue
 
                             stop = curr * STOP_PCT
-                            sl_p = round(curr - stop if direction=="ВВЕРХ" else curr + stop, 4)
-                            tp_p = round(curr + stop*RR if direction=="ВВЕРХ" else curr - stop*RR, 4)
-
                             active_trades.append({
                                 "sym": sym, "side": "BUY" if direction=="ВВЕРХ" else "SELL",
-                                "entry": curr, "sl": sl_p, "tp": tp_p, "key": key,
-                                "start_time": datetime.now(), "be_active": False
+                                "entry": curr, "sl": round(curr - stop if direction=="ВВЕРХ" else curr + stop, 4),
+                                "tp": round(curr + stop*RR if direction=="ВВЕРХ" else curr - stop*RR, 4),
+                                "key": key, "start_time": datetime.now(), "be_active": False
                             })
-                            bot.send_message(CHAT_ID, f"🎯 **ВХОД {sym}**\n💵 Цена: `{curr}`\n🔑 Ключ: `{key}`")
+                            bot.send_message(CHAT_ID, f"🎯 **ВХОД {sym}**\n💵 Цена: `{curr}`\n🔑 Ключ: `{key}`", reply_markup=get_main_menu())
                     except: continue
         time.sleep(15)
 
 @app.route('/')
-def home(): return "Sniper v10.25 Active", 200
+def home(): return "Sniper v10.35 OK", 200
 
 if __name__ == "__main__":
     threading.Thread(target=bot_worker, daemon=True).start()
