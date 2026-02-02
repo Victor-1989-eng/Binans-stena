@@ -1,9 +1,12 @@
-import os, time, threading, json
+import os, time, threading, json, sys
 import pandas as pd
 import ccxt
 import telebot
 from telebot import types
 from flask import Flask
+
+# Логирование запуска для кванта
+print("--- СИСТЕМА ЗАПУСКАЕТСЯ ---")
 
 app = Flask(__name__)
 
@@ -18,32 +21,44 @@ MIN_SAMPLES = 10
 
 # --- [ПАМЯТЬ] ---
 STATS_FILE = "cond_stats.json"
-cond_stats = json.load(open(STATS_FILE)) if os.path.exists(STATS_FILE) else {}
+try:
+    cond_stats = json.load(open(STATS_FILE)) if os.path.exists(STATS_FILE) else {}
+except:
+    cond_stats = {}
+
 stats = {"balance": 1000.0, "wins": 0, "losses": 0, "in_position": False, "side": None, "sl": 0, "tp": 0, "last_key": None}
 
 # --- [API] ---
-bot = telebot.TeleBot(os.environ.get("TELEGRAM_TOKEN"))
+TOKEN = os.environ.get("TELEGRAM_TOKEN")
 CHAT_ID = os.environ.get("CHAT_ID")
 MODE = "paper"
 RUNNING = True
 
+if not TOKEN or not CHAT_ID:
+    print("!!! КРИТИЧЕСКАЯ ОШИБКА: Нет TOKEN или CHAT_ID в настройках Render")
+    sys.exit(1)
+
+bot = telebot.TeleBot(TOKEN)
 exchange = ccxt.binance({'options': {'defaultType': 'future'}})
 
 # --- [КНОПКИ] ---
 def get_main_menu():
     markup = types.InlineKeyboardMarkup(row_width=2)
-    markup.add(types.InlineKeyboardButton("🚀 Start", callback_data="start"),
-               types.InlineKeyboardButton("⏸ Stop", callback_data="stop"),
-               types.InlineKeyboardButton("📝 Paper", callback_data="paper"),
-               types.InlineKeyboardButton("💰 Live", callback_data="live"),
-               types.InlineKeyboardButton("🧠 Мозг", callback_data="stats"),
-               types.InlineKeyboardButton("📊 Баланс", callback_data="balance"))
+    markup.add(
+        types.InlineKeyboardButton("🚀 Start", callback_data="start"),
+        types.InlineKeyboardButton("⏸ Stop", callback_data="stop"),
+        types.InlineKeyboardButton("📝 Paper", callback_data="paper"),
+        types.InlineKeyboardButton("💰 Live", callback_data="live"),
+        types.InlineKeyboardButton("🧠 Мозг", callback_data="stats"),
+        types.InlineKeyboardButton("📊 Баланс", callback_data="balance")
+    )
     return markup
 
 # --- [ОБРАБОТКА ТЕЛЕГРАМ] ---
 @bot.message_handler(commands=['start'])
 def start_cmd(message):
-    bot.send_message(message.chat.id, "🎯 **Sniper v10.4 Онлайн**", reply_markup=get_main_menu())
+    print(f"--- Получена команда /start от {message.chat.id} ---")
+    bot.send_message(message.chat.id, "🎯 **Sniper v10.5 ONLINE**\nБот перешел на систему Polling.", reply_markup=get_main_menu())
 
 @bot.callback_query_handler(func=lambda call: True)
 def callback_query(call):
@@ -57,11 +72,11 @@ def callback_query(call):
         bot.send_message(CHAT_ID, f"📊 Баланс: {round(stats['balance'], 2)}$\nW/L: {stats['wins']}/{stats['losses']}")
     elif action == "stats":
         bot.send_message(CHAT_ID, f"🧠 Паттернов в базе: {len(cond_stats)}")
-    
     bot.answer_callback_query(call.id, f"Выбрано: {action}")
 
 # --- [ЛОГИКА ТОРГОВЛИ] ---
 def bot_worker():
+    print("--- Поток торговли активен ---")
     while True:
         if RUNNING:
             try:
@@ -104,17 +119,23 @@ def bot_worker():
                         stop = curr * STOP_PCT
                         stats.update({"side":side, "last_key":key, "in_position":True, "sl":curr-stop if side=="BUY" else curr+stop, "tp":curr+stop*RR if side=="BUY" else curr-stop*RR})
                         bot.send_message(CHAT_ID, f"🎯 Вход {side}\nКлюч: {key}", reply_markup=get_main_menu())
-            except Exception as e: print(f"Trade Error: {e}")
-        time.sleep(15)
+            except Exception as e: 
+                print(f"!!! Ошибка биржи: {e}")
+        time.sleep(20)
 
 # --- [ЗАПУСК] ---
 @app.route('/')
 def health(): return "OK", 200
 
 if __name__ == "__main__":
-    # Запуск торгового потока
-    threading.Thread(target=bot_worker, daemon=True).start()
-    # Запуск бота (Polling)
+    # 1. Поток торговли
+    t = threading.Thread(target=bot_worker, daemon=True)
+    t.start()
+    
+    # 2. Поток Polling (Телеграм)
+    print("--- Запуск Polling Телеграм ---")
     threading.Thread(target=lambda: bot.infinity_polling(), daemon=True).start()
-    # Flask для Render
-    app.run(host="0.0.0.0", port=10000)
+    
+    # 3. Основной поток Flask
+    port = int(os.environ.get("PORT", 10000))
+    app.run(host="0.0.0.0", port=port)
