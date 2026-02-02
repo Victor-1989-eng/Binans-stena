@@ -28,41 +28,51 @@ active_trades = []
 RUNNING = True
 MODE = "paper"
 
-# --- [ЛОГИКА ПАМЯТИ] ---
+# --- [СИСТЕМА ПАМЯТИ (PIN)] ---
 def save_memory():
     try:
         data = {"stats": stats, "cond_stats": cond_stats}
-        bot.send_message(BACKUP_CHAT_ID, f"#BACKUP\n{json.dumps(data)}")
+        # 1. Отправляем
+        msg = bot.send_message(BACKUP_CHAT_ID, f"#BACKUP\n{json.dumps(data)}")
+        
+        # 2. Пытаемся закрепить
+        try:
+            bot.pin_chat_message(BACKUP_CHAT_ID, msg.message_id)
+        except Exception as e:
+            # Если не вышло закрепить - сообщаем пользователю, но не падаем
+            print(f"⚠️ Не могу закрепить: {e}")
+            if "not enough rights" in str(e) or "administrator" in str(e):
+                bot.send_message(CHAT_ID, "⚠️ **ВНИМАНИЕ:** Бот не может закрепить сообщение!\nСделайте бота **Администратором** канала бэкапов и включите право **'Pin Messages'**.")
+
     except Exception as e:
         print(f"Ошибка сохранения: {e}")
 
 def load_memory():
     global stats, cond_stats
     try:
-        print(f"🔄 Ищу бэкап в канале {BACKUP_CHAT_ID}...")
-        # Пытаемся получить историю (если библиотека поддерживает)
-        # Если бот падает здесь - значит библиотека на Render старая,
-        # но мы обернули в try, чтобы бот не умер.
-        messages = bot.get_chat_history(BACKUP_CHAT_ID, limit=50)
+        print(f"🔄 Проверяю закреп в канале {BACKUP_CHAT_ID}...")
         
-        for msg in messages:
-            if msg.text and "#BACKUP" in msg.text:
-                # Улучшенный парсинг: ищем первую фигурную скобку
-                start_index = msg.text.find('{')
-                if start_index != -1:
-                    json_str = msg.text[start_index:]
-                    data = json.loads(json_str)
-                    
-                    stats = data.get("stats", stats)
-                    cond_stats = data.get("cond_stats", cond_stats)
-                    
-                    msg_text = f"🧠 Память восстановлена!\nБаланс: {round(stats['balance'], 2)}$\nПаттернов: {len(cond_stats)}"
-                    bot.send_message(CHAT_ID, msg_text)
-                    print("✅ Память успешно загружена")
-                    return True
+        try:
+            msg = bot.get_chat_pinned_message(BACKUP_CHAT_ID)
+        except Exception as e:
+            print(f"⚠️ Ошибка получения закрепа: {e}")
+            msg = None
+
+        if msg and msg.text and "#BACKUP" in msg.text:
+            start_index = msg.text.find('{')
+            if start_index != -1:
+                json_str = msg.text[start_index:]
+                data = json.loads(json_str)
+                stats = data.get("stats", stats)
+                cond_stats = data.get("cond_stats", cond_stats)
+                bot.send_message(CHAT_ID, f"🧠 Память загружена!\nБаланс: {round(stats['balance'], 2)}$\nПаттернов: {len(cond_stats)}")
+                return True
+        else:
+            print("⚠️ Нет закрепленного сообщения с бэкапом.")
+            bot.send_message(CHAT_ID, "ℹ️ Память чиста (нет закрепа). Начинаю с нуля.")
+            
     except Exception as e:
-        print(f"⚠️ Ошибка загрузки памяти: {e}")
-        bot.send_message(CHAT_ID, f"⚠️ Не удалось загрузить память автоматически: {e}")
+        print(f"⚠️ Глобальная ошибка загрузки: {e}")
     return False
 
 # --- [ИНТЕРФЕЙС] ---
@@ -80,7 +90,7 @@ def get_main_menu():
 
 @bot.message_handler(commands=['start', 'menu'])
 def send_menu(message):
-    bot.send_message(message.chat.id, f"🎮 Sniper v10.65 | Режим: {MODE.upper()}", reply_markup=get_main_menu())
+    bot.send_message(message.chat.id, f"🎮 Sniper v10.75 | Режим: {MODE.upper()}", reply_markup=get_main_menu())
 
 @bot.callback_query_handler(func=lambda call: True)
 def callback_query(call):
@@ -113,25 +123,22 @@ def bot_worker():
     global stats, active_trades
     while True:
         if RUNNING:
-            # 1. УПРАВЛЕНИЕ ПОЗИЦИЯМИ
+            # 1. УПРАВЛЕНИЕ
             for trade in active_trades[:]:
                 try:
                     ticker = exchange.fetch_ticker(trade["sym"])
                     curr = ticker['last']
                     elapsed = (datetime.now() - trade["start_time"]).total_seconds() / 60
                     
-                    # Безубыток
                     if not trade["be_active"]:
                         dist = (curr - trade["entry"]) / trade["entry"] if trade["side"] == "BUY" else (trade["entry"] - curr) / trade["entry"]
                         if dist >= BE_THRESHOLD:
                             trade["sl"] = trade["entry"]; trade["be_active"] = True
                             bot.send_message(CHAT_ID, f"🛡 **БЕЗУБЫТОК** {trade['sym']}")
 
-                    # Условия выхода
                     hit_tp = (trade["side"] == "BUY" and curr >= trade["tp"]) or (trade["side"] == "SELL" and curr <= trade["tp"])
                     hit_sl = (trade["side"] == "BUY" and curr <= trade["sl"]) or (trade["side"] == "SELL" and curr >= trade["sl"])
                     
-                    # Умный тайм-аут (если 20 мин прошло и мы НЕ в плюсе)
                     is_in_profit = (trade["side"] == "BUY" and curr > trade["entry"]) or (trade["side"] == "SELL" and curr < trade["entry"])
                     timeout = (elapsed >= TIME_LIMIT) and not is_in_profit
 
@@ -155,7 +162,7 @@ def bot_worker():
                         save_memory()
                 except: pass
 
-            # 2. ПОИСК ВХОДА
+            # 2. ПОИСК
             trade_limit = 5 if MODE == "paper" else 1
             if len(active_trades) < trade_limit:
                 for sym in SYMBOLS:
@@ -173,7 +180,6 @@ def bot_worker():
                         f_imp = "Имп" if abs(curr-ema)/ema >= 0.002 else "Вяло"
                         key = f"{sym.split('/')[0]}_{direction}_{f_imp}_{datetime.utcnow().hour}"
                         
-                        # --- ФИЛЬТР МОЗГА ---
                         rec = cond_stats.get(key, {"W":0, "L":0})
                         if (rec["W"] + rec["L"]) >= MIN_SAMPLES:
                             if (rec["W"] / (rec["W"] + rec["L"])) < MIN_EDGE: continue
@@ -185,13 +191,12 @@ def bot_worker():
                             "tp": round(curr + stop*RR if direction=="ВВЕРХ" else curr - stop*RR, 4),
                             "key": key, "start_time": datetime.now(), "be_active": False
                         })
-                        # ВОТ ЗДЕСЬ ВЕРНУЛ ЦЕНУ
                         bot.send_message(CHAT_ID, f"🎯 **ВХОД {sym}**\nЦена: `{curr}`\n🔑: `{key}`")
                     except: continue
         time.sleep(15)
 
 @app.route('/')
-def home(): return "v10.65 Fix OK", 200
+def home(): return "v10.75 Robust OK", 200
 
 if __name__ == "__main__":
     load_memory()
