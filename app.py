@@ -1,125 +1,194 @@
-import os, time, threading, json, sys
-import pandas as pd
-import ccxt
-import telebot
+import os, time, threading, pandas as pd, ccxt, telebot
 from telebot import types
 from flask import Flask
+from datetime import datetime, timedelta
 
-app = Flask(__name__)
-
-# --- [ПАРАМЕТРЫ] ---
-SYMBOL = 'BNB/USDC'
+# --- [КОНФИГ СНАЙПЕРА] ---
+SYMBOLS = ['BNB/USDC', 'ETH/USDC', 'SOL/USDC', 'BTC/USDC', 'DOGE/USDC']
 RISK_USD = 5.0
 RR = 3
 STOP_PCT = 0.005
+BE_THRESHOLD = 0.003  # Безубыток после +0.3% прибыли
+TIME_LIMIT = 20       # Жесткий лимит 20 минут
 EMA_PERIOD = 30
-MIN_EDGE = 0.33
-MIN_SAMPLES = 10
+MIN_EDGE = 0.33       # Минимум 33% винрейта для входа
+MIN_SAMPLES = 2       # Нужно минимум 2 сделки для оценки опыта
 
-# --- [ПАМЯТЬ] ---
-STATS_FILE = "cond_stats.json"
-try:
-    cond_stats = json.load(open(STATS_FILE)) if os.path.exists(STATS_FILE) else {}
-except:
-    cond_stats = {}
+# --- [ГЛОБАЛЬНЫЕ ДАННЫЕ] ---
+stats = {"balance": 1000.0, "wins": 0, "losses": 0}
+active_trades = [] 
+cond_stats = {} # Память времени и профита
 
-stats = {"balance": 1000.0, "wins": 0, "losses": 0, "in_position": False, "side": None, "sl": 0, "tp": 0, "last_key": None}
-
-# --- [API] ---
 TOKEN = os.environ.get("TELEGRAM_TOKEN")
 CHAT_ID = os.environ.get("CHAT_ID")
-MODE = "paper"
+MODE = "paper" 
 RUNNING = True
 
 bot = telebot.TeleBot(TOKEN)
 exchange = ccxt.binance({'options': {'defaultType': 'future'}})
+app = Flask(__name__)
 
-# --- [МЕНЮ] ---
+# --- [ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ] ---
+def get_session():
+    h = datetime.utcnow().hour
+    if 0 <= h < 6: return "Ночь"
+    if 6 <= h < 12: return "Утро"
+    if 12 <= h < 18: return "День"
+    return "Вечер"
+
+def calculate_rsi(series, period=14):
+    delta = series.diff()
+    gain = (delta.where(delta > 0, 0)).rolling(window=period).mean()
+    loss = (-delta.where(delta < 0, 0)).rolling(window=period).mean()
+    rs = gain / loss
+    return 100 - (100 / (1 + rs))
+
 def get_main_menu():
     markup = types.InlineKeyboardMarkup(row_width=2)
     markup.add(
-        types.InlineKeyboardButton("🚀 Start", callback_data="start"),
-        types.InlineKeyboardButton("⏸ Stop", callback_data="stop"),
-        types.InlineKeyboardButton("📝 Paper", callback_data="paper"),
-        types.InlineKeyboardButton("💰 Live", callback_data="live"),
-        types.InlineKeyboardButton("🧠 Мозг", callback_data="stats"),
-        types.InlineKeyboardButton("📊 Баланс", callback_data="balance")
+        types.InlineKeyboardButton("🚀 СТАРТ", callback_data="start"),
+        types.InlineKeyboardButton("⏸ СТОП", callback_data="stop"),
+        types.InlineKeyboardButton("📝 БУМАГА", callback_data="paper"),
+        types.InlineKeyboardButton("💰 LIVE", callback_data="live"),
+        types.InlineKeyboardButton("🧠 МОЗГ", callback_data="stats"),
+        types.InlineKeyboardButton("📊 БАЛАНС", callback_data="balance")
     )
     return markup
 
-@bot.message_handler(commands=['start'])
-def start_cmd(message):
-    bot.send_message(message.chat.id, "🎯 **Sniper v10.6 ONLINE**", reply_markup=get_main_menu())
-
+# --- [ОБРАБОТКА ТЕЛЕГРАМ] ---
 @bot.callback_query_handler(func=lambda call: True)
 def callback_query(call):
     global MODE, RUNNING
-    action = call.data
-    if action == "start": RUNNING = True
-    elif action == "stop": RUNNING = False
-    elif action == "paper": MODE = "paper"
-    elif action == "live": MODE = "live"
-    elif action == "balance":
-        bot.send_message(CHAT_ID, f"📊 Баланс: {round(stats['balance'], 2)}$\nW/L: {stats['wins']}/{stats['losses']}")
-    elif action == "stats":
-        bot.send_message(CHAT_ID, f"🧠 Паттернов: {len(cond_stats)}")
-    bot.answer_callback_query(call.id, f"Выбрано: {action}")
+    if call.data == "paper": MODE = "paper"
+    elif call.data == "live": MODE = "live"
+    elif call.data == "start": RUNNING = True
+    elif call.data == "stop": RUNNING = False
+    elif call.data == "balance":
+        bot.send_message(CHAT_ID, f"📊 Баланс: `{round(stats['balance'], 2)}$` | Активных: {len(active_trades)}")
+    elif call.data == "stats":
+        if not cond_stats:
+            bot.send_message(CHAT_ID, "🧠 Мозг пока пуст...")
+            return
+        res = "🧠 **Анализ Снайпера:**\n\n"
+        for k, v in cond_stats.items():
+            total = v['W'] + v['L'] + v['T']
+            avg_t = round(v['total_time'] / total, 1) if total > 0 else 0
+            wr = round(v['W'] / (v['W'] + v['L']) * 100, 1) if (v['W'] + v['L']) > 0 else 0
+            res += f"● `{k}`\n   └ Win: {wr}% | ⏱ {avg_t} мин.\n"
+        bot.send_message(CHAT_ID, res)
+    bot.answer_callback_query(call.id, f"Ок: {call.data}")
 
-# --- [БЛОК ТОРГОВЛИ] ---
+# --- [ЯДРО БОТА] ---
 def bot_worker():
+    global stats, active_trades
     while True:
         if RUNNING:
-            try:
-                bars = exchange.fetch_ohlcv(SYMBOL, '1m', limit=60)
-                df = pd.DataFrame(bars, columns=['ts','o','h','l','c','v'])
-                curr = df['c'].iloc[-1]
-                ema = df['c'].ewm(span=EMA_PERIOD).mean().iloc[-1]
-
-                if stats["in_position"]:
-                    side = stats["side"]
-                    hit_tp = (side == "BUY" and curr >= stats["tp"]) or (side == "SELL" and curr <= stats["tp"])
-                    hit_sl = (side == "BUY" and curr <= stats["sl"]) or (side == "SELL" and curr >= stats["sl"])
+            # 1. ПРОВЕРКА ВЫХОДА
+            for trade in active_trades[:]:
+                try:
+                    ticker = exchange.fetch_ticker(trade["sym"])
+                    curr = ticker['last']
+                    elapsed = (datetime.now() - trade["start_time"]).total_seconds() / 60
                     
-                    if hit_tp or hit_sl:
-                        win = hit_tp
-                        key = stats["last_key"]
-                        if key:
-                            if key not in cond_stats: cond_stats[key] = {"W":0,"L":0}
-                            if win: cond_stats[key]["W"] += 1
-                            else: cond_stats[key]["L"] += 1
-                            with open(STATS_FILE, "w") as f: json.dump(cond_stats, f)
-                        
-                        stats["balance"] += (RISK_USD * RR) if win else -RISK_USD
-                        if win: stats["wins"]+=1 
-                        else: stats["losses"]+=1
-                        stats["in_position"] = False
-                        bot.send_message(CHAT_ID, f"{'✅ PROFIT' if win else '❌ STOP'}\nБаланс: {round(stats['balance'],2)}$", reply_markup=get_main_menu())
-                
-                else:
-                    closes = df['c'].tail(3).values
-                    imp_up = closes[-1] > closes[-2] > closes[-3]
-                    imp_down = closes[-1] < closes[-2] < closes[-3]
-                    side = "BUY" if (curr > ema and imp_up) else "SELL" if (curr < ema and imp_down) else None
-                    if side:
-                        key = f"{side.lower()}_f{abs(curr-ema)/ema >= 0.002}"
-                        rec = cond_stats.get(key, {"W":0,"L":0})
-                        if (rec["W"]+rec["L"]) >= MIN_SAMPLES and (rec["W"]/(rec["W"]+rec["L"])) < MIN_EDGE: continue
+                    # Логика БЕЗУБЫТКА
+                    if not trade["be_active"]:
+                        dist = (curr - trade["entry"]) / trade["entry"] if trade["side"] == "BUY" else (trade["entry"] - curr) / trade["entry"]
+                        if dist >= BE_THRESHOLD:
+                            trade["sl"] = trade["entry"]
+                            trade["be_active"] = True
+                            bot.send_message(CHAT_ID, f"🛡 **БЕЗУБЫТОК** для {trade['sym']}")
 
-                        stop = curr * STOP_PCT
-                        stats.update({"side":side, "last_key":key, "in_position":True, "sl":curr-stop if side=="BUY" else curr+stop, "tp":curr+stop*RR if side=="BUY" else curr-stop*RR})
-                        bot.send_message(CHAT_ID, f"🎯 Вход {side}\nКлюч: {key}")
-            except Exception as e:
-                print(f"Trade Error: {e}")
+                    # Условия завершения
+                    hit_tp = (trade["side"] == "BUY" and curr >= trade["tp"]) or (trade["side"] == "SELL" and curr <= trade["tp"])
+                    hit_sl = (trade["side"] == "BUY" and curr <= trade["sl"]) or (trade["side"] == "SELL" and curr >= trade["sl"])
+                    timeout = elapsed >= TIME_LIMIT
+
+                    if hit_tp or hit_sl or timeout:
+                        res_usd = 0
+                        res_type = ""
+                        
+                        if hit_tp:
+                            res_usd = RISK_USD * RR
+                            res_type = "win"
+                            txt = f"✅ ПРОФИТ {trade['sym']}"
+                        elif hit_sl:
+                            # Если сработал БУ, убыток 0
+                            res_usd = 0 if trade["be_active"] else -RISK_USD
+                            res_type = "loss"
+                            txt = f"❌ СТОП {trade['sym']}"
+                        else:
+                            # Закрытие по времени (считаем разницу)
+                            pnl_pct = (curr - trade["entry"]) / trade["entry"] if trade["side"] == "BUY" else (trade["entry"] - curr) / trade["entry"]
+                            res_usd = (pnl_pct / STOP_PCT) * RISK_USD
+                            res_type = "timeout"
+                            txt = f"⏰ ТАЙМ-АУТ {trade['sym']}"
+
+                        # Запись в Мозг
+                        k = trade["key"]
+                        if k not in cond_stats: cond_stats[k] = {"W":0, "L":0, "T":0, "total_time": 0}
+                        if res_type == "win": cond_stats[k]["W"] += 1; stats["wins"] += 1
+                        elif res_type == "loss": cond_stats[k]["L"] += 1; stats["losses"] += 1
+                        else: cond_stats[k]["T"] += 1
+                        cond_stats[k]["total_time"] += elapsed
+
+                        stats["balance"] += res_usd
+                        active_trades.remove(trade)
+                        bot.send_message(CHAT_ID, f"{txt}\n💰 Итог: {round(res_usd, 2)}$\n📊 Баланс: {round(stats['balance'], 2)}$")
+                except Exception as e: print(f"Ошибка выхода: {e}")
+
+            # 2. ПОИСК ВХОДА
+            # Лимит: 5 сделок для Бумаги, 1 сделка для Live
+            trade_limit = 5 if MODE == "paper" else 1
+            if len(active_trades) < trade_limit:
+                for sym in SYMBOLS:
+                    if any(t["sym"] == sym for t in active_trades): continue
+                    if len(active_trades) >= trade_limit: break
+                    
+                    try:
+                        bars = exchange.fetch_ohlcv(sym, '1m', limit=100)
+                        df = pd.DataFrame(bars, columns=['ts','o','h','l','c','v'])
+                        curr = df['c'].iloc[-1]
+                        df['ema'] = df['c'].ewm(span=EMA_PERIOD).mean()
+                        df['rsi'] = calculate_rsi(df['c'])
+                        df['vol_ema'] = df['v'].rolling(20).mean()
+                        df['range'] = df['h'] - df['l']
+                        df['range_ema'] = df['range'].rolling(20).mean()
+
+                        ema, rsi = df['ema'].iloc[-1], df['rsi'].iloc[-1]
+                        vol_now, vol_avg = df['v'].iloc[-1], df['vol_ema'].iloc[-1]
+                        range_now, range_avg = df['range'].iloc[-1], df['range_ema'].iloc[-1]
+
+                        direction = "ВВЕРХ" if curr > ema else "ВНИЗ" if curr < ema else None
+                        if direction:
+                            f_imp = "Имп" if abs(curr-ema)/ema >= 0.002 else "Вяло"
+                            f_vol = "Вол" if range_now > range_avg else "Штиль"
+                            f_mon = "Объем" if vol_now > vol_avg else "Пусто"
+                            f_rsi = "Перегрев" if (direction=="ВВЕРХ" and rsi > 70) or (direction=="ВНИЗ" and rsi < 30) else "Сила"
+                            
+                            key = f"{sym.split('/')[0]}_{direction}_{f_imp}_{f_vol}_{get_session()}_{f_mon}_{f_rsi}"
+                            
+                            # Проверка фильтра Мозга
+                            rec = cond_stats.get(key, {"W":0, "L":0, "T":0})
+                            total = rec["W"] + rec["L"]
+                            if total >= MIN_SAMPLES and (rec["W"]/total) < MIN_EDGE: continue
+
+                            stop = curr * STOP_PCT
+                            sl_p = round(curr - stop if direction=="ВВЕРХ" else curr + stop, 4)
+                            tp_p = round(curr + stop*RR if direction=="ВВЕРХ" else curr - stop*RR, 4)
+
+                            active_trades.append({
+                                "sym": sym, "side": "BUY" if direction=="ВВЕРХ" else "SELL",
+                                "entry": curr, "sl": sl_p, "tp": tp_p, "key": key,
+                                "start_time": datetime.now(), "be_active": False
+                            })
+                            bot.send_message(CHAT_ID, f"🎯 **ВХОД {sym}**\n💵 Цена: `{curr}`\n🔑 Ключ: `{key}`")
+                    except: continue
         time.sleep(15)
 
 @app.route('/')
-def health(): return "OK", 200
+def home(): return "Sniper v10.25 Active", 200
 
 if __name__ == "__main__":
-    # Запуск потоков
     threading.Thread(target=bot_worker, daemon=True).start()
     threading.Thread(target=lambda: bot.infinity_polling(), daemon=True).start()
-    
-    # Порт для Render
-    port = int(os.environ.get("PORT", 10000))
-    app.run(host="0.0.0.0", port=port)
+    app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 10000)))
