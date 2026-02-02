@@ -1,112 +1,89 @@
-import os
-import time
-import threading
-import ccxt
-import requests
-import random
+import os, time, random, threading, requests
 import pandas as pd
+import ccxt
 from flask import Flask
 
 app = Flask(__name__)
 
-# --- НАСТРОЙКИ ---
 SYMBOL = 'BNB/USDC'
-RISK_USD = 5.0        # маленький риск на сделку
-COMMISSION_RATE = 0.0004
-STOP_PERCENT = 0.005   # 0.5%
-RR = 3                 # тейк = стоп * 3
-EMA_PERIOD = 10        # период EMA для тренда
+RISK_USD = 5.0
+RR = 3
+STOP_PCT = 0.005
+EMA_PERIOD = 30
 
 stats = {
     "balance": 1000.0,
-    "wins": 0,
-    "losses": 0,
-    "total_fees": 0.0,
-    "in_position": False,
-    "side": None,
-    "sl": 0,
-    "tp": 0,
-    "qty": 0
+    "wins": 0, "losses": 0, "total_fees": 0.0,
+    "in_position": False, "side": None, "sl": 0, "tp": 0, "qty": 0
 }
 
-exchange = ccxt.binance({'options': {'defaultType': 'future'}, 'enableRateLimit': True})
+exchange = ccxt.binance({'options': {'defaultType': 'future'}})
 
 def send_tg(text):
     token = os.environ.get("TELEGRAM_TOKEN")
     chat_id = os.environ.get("CHAT_ID")
     if token and chat_id:
-        try:
-            requests.post(
-                f"https://api.telegram.org/bot{token}/sendMessage",
-                json={"chat_id": chat_id, "text": text, "parse_mode": "Markdown"}
-            )
-        except:
-            pass
+        requests.post(f"https://api.telegram.org/bot{token}/sendMessage",
+                      json={"chat_id": chat_id, "text": text})
 
-def bot_worker():
-    global stats
-    send_tg("🎲 *МИНИ-РУЛЕТКА 1:3 + ТРЕНД ЗАПУЩЕНА*\nРиск на сделку 5$ | Стоп 0.5% | TP ×3 | Вход случайный 1/3 с фильтром EMA10")
+def get_df():
+    bars = exchange.fetch_ohlcv(SYMBOL, '1m', limit=50)
+    return pd.DataFrame(bars, columns=['ts','o','h','l','c','v'])
 
+def bot():
+    send_tg("🚀 v9.3 СНАЙПЕР: анти-флэт + импульс ЗАПУЩЕН")
     while True:
         try:
-            # текущая цена
-            curr_p = exchange.fetch_ticker(SYMBOL)['last']
+            df = get_df()
+            curr = df['c'].iloc[-1]
+            ema = df['c'].ewm(span=EMA_PERIOD).mean().iloc[-1]
 
-            # --- Закрытие позиции ---
             if stats["in_position"]:
                 side = stats["side"]
-                is_tp = (side == "BUY" and curr_p >= stats["tp"]) or (side == "SELL" and curr_p <= stats["tp"])
-                is_sl = (side == "BUY" and curr_p <= stats["sl"]) or (side == "SELL" and curr_p >= stats["sl"])
+                hit_tp = (side=="BUY" and curr>=stats["tp"]) or (side=="SELL" and curr<=stats["tp"])
+                hit_sl = (side=="BUY" and curr<=stats["sl"]) or (side=="SELL" and curr>=stats["sl"])
+                if hit_tp or hit_sl:
+                    res = RISK_USD*RR if hit_tp else -RISK_USD
+                    stats["balance"] += res
+                    if hit_tp: stats["wins"]+=1
+                    else: stats["losses"]+=1
+                    stats["in_position"]=False
+                    send_tg(f"{'✅ ПРОФИТ' if hit_tp else '❌ СТОП'}\nБаланс: {round(stats['balance'],2)}$\n{stats['wins']}W - {stats['losses']}L")
 
-                if is_tp or is_sl:
-                    res = (RISK_USD * RR) if is_tp else -RISK_USD
-                    fee = (stats["qty"] * curr_p * COMMISSION_RATE) * 2
-                    stats["balance"] += (res - fee)
-                    stats["total_fees"] += fee
-                    if is_tp: stats["wins"] += 1
-                    else: stats["losses"] += 1
-                    stats["in_position"] = False
-
-                    msg = "✅ ПРОФИТ" if is_tp else "❌ СТОП"
-                    send_tg(f"{msg}\nБаланс: *{round(stats['balance'],2)}$*\n{stats['wins']}W - {stats['losses']}L")
-                    time.sleep(5)
-
-            # --- Случайный вход 1/3 с фильтром EMA10 ---
             else:
                 if random.random() < 1/3:
-                    # получаем последние свечи
-                    bars = exchange.fetch_ohlcv(SYMBOL, '1m', limit=EMA_PERIOD+1)
-                    df = pd.DataFrame(bars, columns=['ts','o','h','l','c','v'])
-                    ema10 = df['c'].ewm(span=EMA_PERIOD).mean().iloc[-1]
+                    dist = abs(curr-ema)/ema
+                    if dist < 0.002: continue
 
-                    # фильтр по тренду
-                    if curr_p > ema10:
-                        side = "BUY"  # тренд вверх
+                    closes = df['c'].tail(4).values
+                    impulse_up = closes[-1]>closes[-2]>closes[-3]
+                    impulse_down = closes[-1]<closes[-2]<closes[-3]
+
+                    rng = (df['h'].tail(10).max() - df['l'].tail(10).min()) / curr
+                    if rng < 0.006: continue
+
+                    if curr > ema and impulse_up:
+                        side="BUY"
+                    elif curr < ema and impulse_down:
+                        side="SELL"
                     else:
-                        side = "SELL" # тренд вниз
+                        continue
 
-                    stop_dist = curr_p * STOP_PERCENT
-                    stats["qty"] = RISK_USD / stop_dist
-                    stats["side"] = side
+                    stop = curr * STOP_PCT
+                    stats["side"]=side
+                    stats["sl"]= curr-stop if side=="BUY" else curr+stop
+                    stats["tp"]= curr+stop*RR if side=="BUY" else curr-stop*RR
+                    stats["in_position"]=True
 
-                    if side == "BUY":
-                        stats["sl"], stats["tp"] = curr_p - stop_dist, curr_p + stop_dist*RR
-                    else:
-                        stats["sl"], stats["tp"] = curr_p + stop_dist, curr_p - stop_dist*RR
-
-                    stats["in_position"] = True
-                    send_tg(f"🎲 Мини-вход с трендом: {side}\nЦена: {curr_p}\nTP: {round(stats['tp'],2)} | SL: {round(stats['sl'],2)}")
-
-        except Exception:
+                    send_tg(f"🎯 ВХОД {side}\nЦена: {curr}\nTP: {round(stats['tp'],2)} SL: {round(stats['sl'],2)}")
+        except:
             time.sleep(5)
-
         time.sleep(10)
 
-threading.Thread(target=bot_worker, daemon=True).start()
+threading.Thread(target=bot, daemon=True).start()
 
 @app.route('/')
-def health():
-    return f"Balance: {stats['balance']}", 200
+def health(): return f"Balance: {stats['balance']}", 200
 
 if __name__ == "__main__":
-    app.run(host='0.0.0.0', port=10000)
+    app.run(host="0.0.0.0", port=10000)
