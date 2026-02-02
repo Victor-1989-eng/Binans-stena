@@ -8,12 +8,12 @@ app = Flask(__name__)
 
 # --- [КОНФИГУРАЦИЯ] ---
 SYMBOL = 'BNB/USDC'
-RISK_USD = 5.0      # Риск на сделку
-RR = 3              # Соотношение Риск/Прибыль (1:3)
-STOP_PCT = 0.005    # Базовый стоп 0.5%
+RISK_USD = 5.0      
+RR = 3              
+STOP_PCT = 0.005    
 EMA_PERIOD = 30
-MIN_EDGE = 0.33     # Порог вероятности для входа (1/3)
-MIN_SAMPLES = 10    # Минимальная выборка для доверия статистике
+MIN_EDGE = 0.33     
+MIN_SAMPLES = 10    
 LEVERAGE = 50
 
 # --- [ПАМЯТЬ И СТАТИСТИКА] ---
@@ -62,14 +62,15 @@ def get_buttons():
 # --- [ЯДРО БОТА] ---
 def bot_worker():
     global RUNNING, MODE
-    send_tg(f"🤖 **v10.1 QUANT SNIPER ЗАПУЩЕН**\nПара: `{SYMBOL}` | Режим: `{MODE}`", buttons=get_buttons())
+    # Ждем запуска сервера, прежде чем слать приветствие
+    time.sleep(5)
+    send_tg(f"🤖 **v10.2 QUANT SNIPER ОЖИЛ**\nНапиши /start для меню.", buttons=get_buttons())
     
     while True:
         if not RUNNING:
             time.sleep(5); continue
 
         try:
-            # Получение данных
             bars = exchange.fetch_ohlcv(SYMBOL, '1m', limit=100)
             df = pd.DataFrame(bars, columns=['ts','o','h','l','c','v'])
             curr = df['c'].iloc[-1]
@@ -100,7 +101,6 @@ def bot_worker():
 
             # 2. ПОИСК СИГНАЛА
             else:
-                # Математические признаки (Features)
                 closes = df['c'].tail(4).values
                 imp_up = closes[-1] > closes[-2] > closes[-3]
                 imp_down = closes[-1] < closes[-2] < closes[-3]
@@ -116,11 +116,9 @@ def bot_worker():
                     rec = cond_stats.get(key, {"W": 0, "L": 0})
                     total = rec["W"] + rec["L"]
                     
-                    # Фильтр статистического преимущества
                     if total >= MIN_SAMPLES and (rec["W"] / total) < MIN_EDGE:
                         continue
 
-                    # Расчет ордера
                     stop_dist = curr * STOP_PCT
                     stats.update({
                         "side": side, "last_key": key, "in_position": True,
@@ -128,14 +126,11 @@ def bot_worker():
                         "tp": curr + (stop_dist * RR) if side == "BUY" else curr - (stop_dist * RR)
                     })
 
-                    # ИСПОЛНЕНИЕ LIVE (Если включено)
                     if MODE == "live":
                         try:
                             exchange.set_leverage(LEVERAGE, SYMBOL)
                             qty = float(exchange.amount_to_precision(SYMBOL, RISK_USD / stop_dist))
                             exchange.create_market_order(SYMBOL, side.lower(), qty)
-                            
-                            # Ордера SL/TP на бирже
                             opp = 'sell' if side == "BUY" else 'buy'
                             exchange.create_order(SYMBOL, 'STOP_MARKET', opp, qty, params={'stopPrice': stats["sl"], 'reduceOnly': True})
                             exchange.create_order(SYMBOL, 'TAKE_PROFIT_MARKET', opp, qty, params={'stopPrice': stats["tp"], 'reduceOnly': True})
@@ -149,11 +144,20 @@ def bot_worker():
             time.sleep(10)
         time.sleep(15)
 
-# --- [ОБРАБОТКА КНОПОК] ---
+# --- [ОБРАБОТКА WEBHOOK (СООБЩЕНИЯ + КНОПКИ)] ---
 @app.route('/webhook', methods=['POST'])
 def webhook():
     global MODE, RUNNING
     data = request.json
+    
+    # Реакция на текстовые сообщения (команда /start)
+    if "message" in data:
+        msg = data["message"]
+        if msg.get("text") == "/start":
+            send_tg("🚀 **Квантовый Снайпер v10.2**\nВыбери режим работы:", buttons=get_buttons())
+            return "ok", 200
+
+    # Реакция на нажатия кнопок
     if "callback_query" in data:
         cb = data["callback_query"]
         action = cb["data"]
