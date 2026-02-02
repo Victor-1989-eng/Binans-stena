@@ -3,7 +3,7 @@ from telebot import types
 from flask import Flask
 from datetime import datetime
 
-# --- [ПОЛНЫЙ КОНФИГ СНАЙПЕРА] ---
+# --- [КОНФИГ] ---
 SYMBOLS = ['BNB/USDC', 'ETH/USDC', 'SOL/USDC', 'BTC/USDC', 'DOGE/USDC']
 RISK_USD = 5.0
 RR = 3
@@ -11,8 +11,8 @@ STOP_PCT = 0.005
 BE_THRESHOLD = 0.003
 TIME_LIMIT = 20
 EMA_PERIOD = 30
-MIN_EDGE = 0.33      # Минимальный винрейт для входа
-MIN_SAMPLES = 2      # Минимум сделок для начала фильтрации
+MIN_EDGE = 0.33
+MIN_SAMPLES = 2
 
 TOKEN = os.environ.get("TELEGRAM_TOKEN")
 CHAT_ID = os.environ.get("CHAT_ID")
@@ -33,21 +33,36 @@ def save_memory():
     try:
         data = {"stats": stats, "cond_stats": cond_stats}
         bot.send_message(BACKUP_CHAT_ID, f"#BACKUP\n{json.dumps(data)}")
-    except: pass
+    except Exception as e:
+        print(f"Ошибка сохранения: {e}")
 
 def load_memory():
     global stats, cond_stats
     try:
-        messages = bot.get_chat_history(BACKUP_CHAT_ID, limit=100)
+        print(f"🔄 Ищу бэкап в канале {BACKUP_CHAT_ID}...")
+        # Пытаемся получить историю (если библиотека поддерживает)
+        # Если бот падает здесь - значит библиотека на Render старая,
+        # но мы обернули в try, чтобы бот не умер.
+        messages = bot.get_chat_history(BACKUP_CHAT_ID, limit=50)
+        
         for msg in messages:
-            if msg.text and msg.text.startswith("#BACKUP"):
-                raw_data = msg.text.replace("#BACKUP\n", "")
-                data = json.loads(raw_data)
-                stats = data.get("stats", stats)
-                cond_stats = data.get("cond_stats", cond_stats)
-                bot.send_message(CHAT_ID, f"🧠 Память восстановлена. Паттернов: {len(cond_stats)}")
-                return True
-    except: pass
+            if msg.text and "#BACKUP" in msg.text:
+                # Улучшенный парсинг: ищем первую фигурную скобку
+                start_index = msg.text.find('{')
+                if start_index != -1:
+                    json_str = msg.text[start_index:]
+                    data = json.loads(json_str)
+                    
+                    stats = data.get("stats", stats)
+                    cond_stats = data.get("cond_stats", cond_stats)
+                    
+                    msg_text = f"🧠 Память восстановлена!\nБаланс: {round(stats['balance'], 2)}$\nПаттернов: {len(cond_stats)}"
+                    bot.send_message(CHAT_ID, msg_text)
+                    print("✅ Память успешно загружена")
+                    return True
+    except Exception as e:
+        print(f"⚠️ Ошибка загрузки памяти: {e}")
+        bot.send_message(CHAT_ID, f"⚠️ Не удалось загрузить память автоматически: {e}")
     return False
 
 # --- [ИНТЕРФЕЙС] ---
@@ -65,7 +80,7 @@ def get_main_menu():
 
 @bot.message_handler(commands=['start', 'menu'])
 def send_menu(message):
-    bot.send_message(message.chat.id, f"🎮 Sniper v10.60 | Режим: {MODE.upper()}", reply_markup=get_main_menu())
+    bot.send_message(message.chat.id, f"🎮 Sniper v10.65 | Режим: {MODE.upper()}", reply_markup=get_main_menu())
 
 @bot.callback_query_handler(func=lambda call: True)
 def callback_query(call):
@@ -79,13 +94,12 @@ def callback_query(call):
     elif call.data == "stats":
         if not cond_stats: bot.send_message(CHAT_ID, "🧠 Мозг пуст."); return
         res = "🧠 **АНАЛИЗ ПАТТЕРНОВ:**\n"
-        # Показываем последние 15 состояний
         for k, v in list(cond_stats.items())[-15:]:
             total = v['W'] + v['L'] + v['T']
             wr = round(v['W'] / (v['W'] + v['L']) * 100, 1) if (v['W'] + v['L']) > 0 else 0
-            res += f"● `{k}`: {wr}% WR | {total} сделок\n"
+            res += f"● `{k}`: {wr}% WR | {total} сд.\n"
         bot.send_message(CHAT_ID, res)
-    bot.answer_callback_query(call.id, f"Ок: {call.data}")
+    bot.answer_callback_query(call.id, "Ок")
 
 # --- [ЯДРО] ---
 def calculate_rsi(series, period=14):
@@ -99,23 +113,25 @@ def bot_worker():
     global stats, active_trades
     while True:
         if RUNNING:
-            # 1. КОНТРОЛЬ ПОЗИЦИЙ
+            # 1. УПРАВЛЕНИЕ ПОЗИЦИЯМИ
             for trade in active_trades[:]:
                 try:
                     ticker = exchange.fetch_ticker(trade["sym"])
                     curr = ticker['last']
                     elapsed = (datetime.now() - trade["start_time"]).total_seconds() / 60
                     
+                    # Безубыток
                     if not trade["be_active"]:
                         dist = (curr - trade["entry"]) / trade["entry"] if trade["side"] == "BUY" else (trade["entry"] - curr) / trade["entry"]
                         if dist >= BE_THRESHOLD:
                             trade["sl"] = trade["entry"]; trade["be_active"] = True
-                            bot.send_message(CHAT_ID, f"🛡 {trade['sym']} в безубытке")
+                            bot.send_message(CHAT_ID, f"🛡 **БЕЗУБЫТОК** {trade['sym']}")
 
+                    # Условия выхода
                     hit_tp = (trade["side"] == "BUY" and curr >= trade["tp"]) or (trade["side"] == "SELL" and curr <= trade["tp"])
                     hit_sl = (trade["side"] == "BUY" and curr <= trade["sl"]) or (trade["side"] == "SELL" and curr >= trade["sl"])
                     
-                    # Умный тайм-аут: не закрываем, если есть профит
+                    # Умный тайм-аут (если 20 мин прошло и мы НЕ в плюсе)
                     is_in_profit = (trade["side"] == "BUY" and curr > trade["entry"]) or (trade["side"] == "SELL" and curr < trade["entry"])
                     timeout = (elapsed >= TIME_LIMIT) and not is_in_profit
 
@@ -151,13 +167,13 @@ def bot_worker():
                         curr = df['c'].iloc[-1]
                         df['ema'] = df['c'].ewm(span=EMA_PERIOD).mean()
                         df['rsi'] = calculate_rsi(df['c'])
-                        ema, rsi = df['ema'].iloc[-1], df['rsi'].iloc[-1]
+                        ema = df['ema'].iloc[-1]
                         
                         direction = "ВВЕРХ" if curr > ema else "ВНИЗ"
                         f_imp = "Имп" if abs(curr-ema)/ema >= 0.002 else "Вяло"
                         key = f"{sym.split('/')[0]}_{direction}_{f_imp}_{datetime.utcnow().hour}"
                         
-                        # --- ПРОВЕРКА ОПЫТА ---
+                        # --- ФИЛЬТР МОЗГА ---
                         rec = cond_stats.get(key, {"W":0, "L":0})
                         if (rec["W"] + rec["L"]) >= MIN_SAMPLES:
                             if (rec["W"] / (rec["W"] + rec["L"])) < MIN_EDGE: continue
@@ -169,12 +185,13 @@ def bot_worker():
                             "tp": round(curr + stop*RR if direction=="ВВЕРХ" else curr - stop*RR, 4),
                             "key": key, "start_time": datetime.now(), "be_active": False
                         })
-                        bot.send_message(CHAT_ID, f"🎯 ВХОД {sym}\n🔑 {key}")
+                        # ВОТ ЗДЕСЬ ВЕРНУЛ ЦЕНУ
+                        bot.send_message(CHAT_ID, f"🎯 **ВХОД {sym}**\nЦена: `{curr}`\n🔑: `{key}`")
                     except: continue
         time.sleep(15)
 
 @app.route('/')
-def home(): return "v10.60 Master Sniper OK", 200
+def home(): return "v10.65 Fix OK", 200
 
 if __name__ == "__main__":
     load_memory()
