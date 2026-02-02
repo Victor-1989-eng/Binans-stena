@@ -5,12 +5,9 @@ import telebot
 from telebot import types
 from flask import Flask
 
-# Логирование запуска для кванта
-print("--- СИСТЕМА ЗАПУСКАЕТСЯ ---")
-
 app = Flask(__name__)
 
-# --- [КОНФИГУРАЦИЯ] ---
+# --- [ПАРАМЕТРЫ] ---
 SYMBOL = 'BNB/USDC'
 RISK_USD = 5.0
 RR = 3
@@ -34,14 +31,10 @@ CHAT_ID = os.environ.get("CHAT_ID")
 MODE = "paper"
 RUNNING = True
 
-if not TOKEN or not CHAT_ID:
-    print("!!! КРИТИЧЕСКАЯ ОШИБКА: Нет TOKEN или CHAT_ID в настройках Render")
-    sys.exit(1)
-
 bot = telebot.TeleBot(TOKEN)
 exchange = ccxt.binance({'options': {'defaultType': 'future'}})
 
-# --- [КНОПКИ] ---
+# --- [МЕНЮ] ---
 def get_main_menu():
     markup = types.InlineKeyboardMarkup(row_width=2)
     markup.add(
@@ -54,11 +47,9 @@ def get_main_menu():
     )
     return markup
 
-# --- [ОБРАБОТКА ТЕЛЕГРАМ] ---
 @bot.message_handler(commands=['start'])
 def start_cmd(message):
-    print(f"--- Получена команда /start от {message.chat.id} ---")
-    bot.send_message(message.chat.id, "🎯 **Sniper v10.5 ONLINE**\nБот перешел на систему Polling.", reply_markup=get_main_menu())
+    bot.send_message(message.chat.id, "🎯 **Sniper v10.6 ONLINE**", reply_markup=get_main_menu())
 
 @bot.callback_query_handler(func=lambda call: True)
 def callback_query(call):
@@ -71,12 +62,11 @@ def callback_query(call):
     elif action == "balance":
         bot.send_message(CHAT_ID, f"📊 Баланс: {round(stats['balance'], 2)}$\nW/L: {stats['wins']}/{stats['losses']}")
     elif action == "stats":
-        bot.send_message(CHAT_ID, f"🧠 Паттернов в базе: {len(cond_stats)}")
+        bot.send_message(CHAT_ID, f"🧠 Паттернов: {len(cond_stats)}")
     bot.answer_callback_query(call.id, f"Выбрано: {action}")
 
-# --- [ЛОГИКА ТОРГОВЛИ] ---
+# --- [БЛОК ТОРГОВЛИ] ---
 def bot_worker():
-    print("--- Поток торговли активен ---")
     while True:
         if RUNNING:
             try:
@@ -109,7 +99,6 @@ def bot_worker():
                     closes = df['c'].tail(3).values
                     imp_up = closes[-1] > closes[-2] > closes[-3]
                     imp_down = closes[-1] < closes[-2] < closes[-3]
-                    
                     side = "BUY" if (curr > ema and imp_up) else "SELL" if (curr < ema and imp_down) else None
                     if side:
                         key = f"{side.lower()}_f{abs(curr-ema)/ema >= 0.002}"
@@ -118,24 +107,19 @@ def bot_worker():
 
                         stop = curr * STOP_PCT
                         stats.update({"side":side, "last_key":key, "in_position":True, "sl":curr-stop if side=="BUY" else curr+stop, "tp":curr+stop*RR if side=="BUY" else curr-stop*RR})
-                        bot.send_message(CHAT_ID, f"🎯 Вход {side}\nКлюч: {key}", reply_markup=get_main_menu())
-            except Exception as e: 
-                print(f"!!! Ошибка биржи: {e}")
-        time.sleep(20)
+                        bot.send_message(CHAT_ID, f"🎯 Вход {side}\nКлюч: {key}")
+            except Exception as e:
+                print(f"Trade Error: {e}")
+        time.sleep(15)
 
-# --- [ЗАПУСК] ---
 @app.route('/')
 def health(): return "OK", 200
 
 if __name__ == "__main__":
-    # 1. Поток торговли
-    t = threading.Thread(target=bot_worker, daemon=True)
-    t.start()
-    
-    # 2. Поток Polling (Телеграм)
-    print("--- Запуск Polling Телеграм ---")
+    # Запуск потоков
+    threading.Thread(target=bot_worker, daemon=True).start()
     threading.Thread(target=lambda: bot.infinity_polling(), daemon=True).start()
     
-    # 3. Основной поток Flask
+    # Порт для Render
     port = int(os.environ.get("PORT", 10000))
     app.run(host="0.0.0.0", port=port)
