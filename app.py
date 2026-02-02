@@ -3,7 +3,7 @@ from telebot import types
 from flask import Flask
 from datetime import datetime
 
-# --- [КОНФИГ СНАЙПЕРА - ВСЕ ПАРАМЕТРЫ НА МЕСТЕ] ---
+# --- [ПОЛНЫЙ КОНФИГ СНАЙПЕРА] ---
 SYMBOLS = ['BNB/USDC', 'ETH/USDC', 'SOL/USDC', 'BTC/USDC', 'DOGE/USDC']
 RISK_USD = 5.0
 RR = 3
@@ -12,7 +12,7 @@ BE_THRESHOLD = 0.003
 TIME_LIMIT = 20
 EMA_PERIOD = 30
 MIN_EDGE = 0.33      # Минимальный винрейт для входа
-MIN_SAMPLES = 2      # Минимум сделок для учета статистики
+MIN_SAMPLES = 2      # Минимум сделок для начала фильтрации
 
 TOKEN = os.environ.get("TELEGRAM_TOKEN")
 CHAT_ID = os.environ.get("CHAT_ID")
@@ -38,14 +38,14 @@ def save_memory():
 def load_memory():
     global stats, cond_stats
     try:
-        messages = bot.get_chat_history(BACKUP_CHAT_ID, limit=50)
+        messages = bot.get_chat_history(BACKUP_CHAT_ID, limit=100)
         for msg in messages:
             if msg.text and msg.text.startswith("#BACKUP"):
                 raw_data = msg.text.replace("#BACKUP\n", "")
                 data = json.loads(raw_data)
                 stats = data.get("stats", stats)
                 cond_stats = data.get("cond_stats", cond_stats)
-                bot.send_message(CHAT_ID, f"🧠 Память восстановлена! Паттернов: {len(cond_stats)}")
+                bot.send_message(CHAT_ID, f"🧠 Память восстановлена. Паттернов: {len(cond_stats)}")
                 return True
     except: pass
     return False
@@ -56,6 +56,8 @@ def get_main_menu():
     markup.add(
         types.InlineKeyboardButton("🚀 СТАРТ", callback_data="start"),
         types.InlineKeyboardButton("⏸ СТОП", callback_data="stop"),
+        types.InlineKeyboardButton("📝 БУМАГА", callback_data="paper"),
+        types.InlineKeyboardButton("💰 LIVE", callback_data="live"),
         types.InlineKeyboardButton("🧠 МОЗГ", callback_data="stats"),
         types.InlineKeyboardButton("📊 БАЛАНС", callback_data="balance")
     )
@@ -63,27 +65,29 @@ def get_main_menu():
 
 @bot.message_handler(commands=['start', 'menu'])
 def send_menu(message):
-    bot.send_message(message.chat.id, "🎯 Sniper v10.55 | Режим: " + MODE.upper(), reply_markup=get_main_menu())
+    bot.send_message(message.chat.id, f"🎮 Sniper v10.60 | Режим: {MODE.upper()}", reply_markup=get_main_menu())
 
 @bot.callback_query_handler(func=lambda call: True)
 def callback_query(call):
-    global RUNNING
-    if call.data == "start": RUNNING = True
+    global MODE, RUNNING
+    if call.data == "paper": MODE = "paper"
+    elif call.data == "live": MODE = "live"
+    elif call.data == "start": RUNNING = True
     elif call.data == "stop": RUNNING = False
     elif call.data == "balance":
         bot.send_message(CHAT_ID, f"📊 Баланс: `{round(stats['balance'], 2)}$` | Открыто: {len(active_trades)}")
     elif call.data == "stats":
         if not cond_stats: bot.send_message(CHAT_ID, "🧠 Мозг пуст."); return
         res = "🧠 **АНАЛИЗ ПАТТЕРНОВ:**\n"
-        # Показываем только те, где есть хоть какой-то результат
-        for k, v in list(cond_stats.items())[-10:]:
+        # Показываем последние 15 состояний
+        for k, v in list(cond_stats.items())[-15:]:
             total = v['W'] + v['L'] + v['T']
             wr = round(v['W'] / (v['W'] + v['L']) * 100, 1) if (v['W'] + v['L']) > 0 else 0
-            res += f"● `{k}`: {wr}% WR | {total} поп.\n"
+            res += f"● `{k}`: {wr}% WR | {total} сделок\n"
         bot.send_message(CHAT_ID, res)
-    bot.answer_callback_query(call.id)
+    bot.answer_callback_query(call.id, f"Ок: {call.data}")
 
-# --- [МАТЕМАТИКА] ---
+# --- [ЯДРО] ---
 def calculate_rsi(series, period=14):
     delta = series.diff()
     gain = (delta.where(delta > 0, 0)).rolling(period).mean()
@@ -95,7 +99,7 @@ def bot_worker():
     global stats, active_trades
     while True:
         if RUNNING:
-            # 1. ПРОВЕРКА ВЫХОДА
+            # 1. КОНТРОЛЬ ПОЗИЦИЙ
             for trade in active_trades[:]:
                 try:
                     ticker = exchange.fetch_ticker(trade["sym"])
@@ -106,12 +110,12 @@ def bot_worker():
                         dist = (curr - trade["entry"]) / trade["entry"] if trade["side"] == "BUY" else (trade["entry"] - curr) / trade["entry"]
                         if dist >= BE_THRESHOLD:
                             trade["sl"] = trade["entry"]; trade["be_active"] = True
-                            bot.send_message(CHAT_ID, f"🛡 БЕЗУБЫТОК {trade['sym']}")
+                            bot.send_message(CHAT_ID, f"🛡 {trade['sym']} в безубытке")
 
                     hit_tp = (trade["side"] == "BUY" and curr >= trade["tp"]) or (trade["side"] == "SELL" and curr <= trade["tp"])
                     hit_sl = (trade["side"] == "BUY" and curr <= trade["sl"]) or (trade["side"] == "SELL" and curr >= trade["sl"])
                     
-                    # УМНЫЙ ТАЙМ-АУТ (v10.50+)
+                    # Умный тайм-аут: не закрываем, если есть профит
                     is_in_profit = (trade["side"] == "BUY" and curr > trade["entry"]) or (trade["side"] == "SELL" and curr < trade["entry"])
                     timeout = (elapsed >= TIME_LIMIT) and not is_in_profit
 
@@ -135,10 +139,12 @@ def bot_worker():
                         save_memory()
                 except: pass
 
-            # 2. ПОИСК ВХОДА (С ФИЛЬТРОМ ОПЫТА)
-            if len(active_trades) < 5:
+            # 2. ПОИСК ВХОДА
+            trade_limit = 5 if MODE == "paper" else 1
+            if len(active_trades) < trade_limit:
                 for sym in SYMBOLS:
                     if any(t["sym"] == sym for t in active_trades): continue
+                    if len(active_trades) >= trade_limit: break
                     try:
                         bars = exchange.fetch_ohlcv(sym, '1m', limit=50)
                         df = pd.DataFrame(bars, columns=['ts','o','h','l','c','v'])
@@ -151,11 +157,10 @@ def bot_worker():
                         f_imp = "Имп" if abs(curr-ema)/ema >= 0.002 else "Вяло"
                         key = f"{sym.split('/')[0]}_{direction}_{f_imp}_{datetime.utcnow().hour}"
                         
-                        # --- ФИЛЬТР МОЗГА (ТОТ САМЫЙ!) ---
+                        # --- ПРОВЕРКА ОПЫТА ---
                         rec = cond_stats.get(key, {"W":0, "L":0})
                         if (rec["W"] + rec["L"]) >= MIN_SAMPLES:
-                            winrate = rec["W"] / (rec["W"] + rec["L"])
-                            if winrate < MIN_EDGE: continue # Пропускаем плохой паттерн
+                            if (rec["W"] / (rec["W"] + rec["L"])) < MIN_EDGE: continue
 
                         stop = curr * STOP_PCT
                         active_trades.append({
@@ -169,7 +174,7 @@ def bot_worker():
         time.sleep(15)
 
 @app.route('/')
-def home(): return "v10.55 Final Hybrid OK", 200
+def home(): return "v10.60 Master Sniper OK", 200
 
 if __name__ == "__main__":
     load_memory()
