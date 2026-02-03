@@ -14,7 +14,7 @@ LEVERAGE = 75
 MARGIN_USDC = 1.0
 EMA_FAST = 7
 EMA_SLOW = 25
-MIN_GAP = 0.0006  # Защита от пилы (0.06%)
+MIN_GAP = 0.0006  # Зазор только для ВХОДА
 # ---------------------------
 
 client = Client(os.environ.get("BINANCE_API_KEY"), os.environ.get("BINANCE_API_SECRET"))
@@ -39,8 +39,8 @@ def setup_account(symbol):
         print(f"Leverage error {symbol}: {e}")
 
 def run_scanner():
-    print(f"💀 Режим 'Изолированный Агрессор' v4.2 запущен!")
-    send_tg(f"🛡 *Снайпер v4.2 (Anti-Chop)* АКТИВИРОВАН\nПары: `{SYMBOLS}`\nФильтр пилы: `{MIN_GAP*100}%` зазора")
+    print(f"💀 Снайпер v4.3 (Fast Exit / Smart Entry) запущен!")
+    send_tg(f"🎯 *Снайпер v4.3 АКТИВИРОВАН*\nВыход: `Мгновенный по 7/25`\nВход: `Только с зазором {MIN_GAP*100}%`")
     
     for s in SYMBOLS: setup_account(s)
 
@@ -71,15 +71,21 @@ def run_scanner():
                     amt = float(active[0]['positionAmt'])
                     current_side = "LONG" if amt > 0 else "SHORT"
                     
-                    # ПЕРЕВЕРТЫШ: Только если есть сигнал И линии разошлись
-                    if signal and signal != current_side and gap >= MIN_GAP:
+                    # ВЫХОД (РЕВЕРС): Выходим всегда при пересечении, но входим обратно только если есть GAP
+                    if signal and signal != current_side:
+                        # 1. Закрываем текущую позицию СРАЗУ
                         client.futures_create_order(symbol=symbol, side='SELL' if current_side=="LONG" else 'BUY', 
                                                   type='MARKET', quantity=abs(amt), reduceOnly=True)
-                        time.sleep(0.1)
-                        execute_trade(symbol, signal, closes[-1])
-                        send_tg(f"🔄 *{symbol}*: Реверс в {signal} (Пробой пилы)")
+                        send_tg(f"🏁 *{symbol}*: Закрыл {current_side} (разворот)")
+                        
+                        # 2. Пробуем войти в новую, если зазор позволяет
+                        if gap >= MIN_GAP:
+                            time.sleep(0.1)
+                            execute_trade(symbol, signal, closes[-1])
+                        else:
+                            send_tg(f"💤 *{symbol}*: Жду зазора для входа в {signal}...")
                 else:
-                    # ВХОД: Только если линии разошлись
+                    # ВХОД В НОВУЮ: Только если есть сигнал И линии разошлись
                     if signal and gap >= MIN_GAP:
                         execute_trade(symbol, signal, closes[-1])
 
@@ -101,7 +107,7 @@ def execute_trade(symbol, side, price):
 
 threading.Thread(target=run_scanner, daemon=True).start()
 @app.route('/')
-def health(): return "Aggressive Scalper v4.2 Active"
+def health(): return "Scalper v4.3 Active"
 
 if __name__ == "__main__":
     app.run(host='0.0.0.0', port=int(os.environ.get("PORT", 10000)))
