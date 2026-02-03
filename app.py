@@ -7,20 +7,17 @@ from binance.enums import *
 
 app = Flask(__name__)
 
-# --- НАСТРОЙКИ ---
-SYMBOL = 'BNBUSDC'
+# --- ГЕОМЕТРИЯ И НАСТРОЙКИ ---
+SYMBOL = 'SOLUSDC'
+TIMEFRAME = '1m'
 LEVERAGE = 75
+MARGIN_USDC = 1.0  # Твоя ставка (1$)
+
 EMA_FAST = 25
 EMA_SLOW = 99
-SL_PCT = 0.003    # Стоп 0.3% (Риск 1$)
-TP_PCT = 0.009    # Тейк 0.9% (Профит 3$)
-BE_TRIGGER = 0.0045 # БУ при +0.45%
-
-# ФИЛЬТР НАКЛОНА (Slope)
-# Минимальное изменение EMA за 3 свечи в процентах
-# 0.0005 = 0.05% наклона. Если меньше - считаем движение слабым.
-MIN_SLOPE = 0.0003 
-# -----------------
+MIN_SLOPE = 0.0005  # Фильтр для SOL (наклон импульса)
+EMERGENCY_SL = 0.03 # Аварийный стоп 3%
+# -----------------------------
 
 def get_binance_client():
     return Client(os.environ.get("BINANCE_API_KEY"), os.environ.get("BINANCE_API_SECRET"))
@@ -34,81 +31,75 @@ def send_tg(text):
 def run_bot():
     client = get_binance_client()
     try:
-        # 1. Проверка позиции и БУ
-        pos = client.futures_position_information(symbol=SYMBOL)
-        active_pos = [p for p in pos if float(p['positionAmt']) != 0]
-        
-        if active_pos:
-            p = active_pos[0]
-            amt, entry = float(p['positionAmt']), float(p['entryPrice'])
-            curr = float(client.futures_symbol_ticker(symbol=SYMBOL)['price'])
-            side_long = amt > 0
-            pnl = (curr - entry) / entry if side_long else (entry - curr) / entry
-            
-            if pnl >= BE_TRIGGER:
-                orders = client.futures_get_open_orders(symbol=SYMBOL)
-                for o in orders:
-                    if o['type'] in ['STOP_MARKET', 'STOP'] and abs(float(o['stopPrice']) - entry) > 0.05:
-                        client.futures_cancel_order(symbol=SYMBOL, orderId=o['orderId'])
-                        client.futures_create_order(symbol=SYMBOL, side='SELL' if side_long else 'BUY', 
-                                                  type='STOP_MARKET', stopPrice=str(round(entry, 2)), reduceOnly=True)
-                        send_tg(f"🛡 *БЕЗУБЫТОК*: Защита активирована")
-            return f"В сделке. PNL: {pnl*100:.2f}%"
-
-        # 2. Расчет EMA и Наклона
-        klines = client.futures_klines(symbol=SYMBOL, interval='1m', limit=150)
+        # 1. Считаем EMA на минутках
+        klines = client.futures_klines(symbol=SYMBOL, interval=TIMEFRAME, limit=150)
         closes = [float(k[4]) for k in klines]
-        
         ema_f = pd.Series(closes).ewm(span=EMA_FAST, adjust=False).mean()
         ema_s = pd.Series(closes).ewm(span=EMA_SLOW, adjust=False).mean()
 
-        # Текущие и прошлые значения для проверки пересечения
         f_now, s_now = ema_f.iloc[-1], ema_s.iloc[-1]
         f_prev, s_prev = ema_f.iloc[-2], ema_s.iloc[-2]
-
-        # Расчет наклона быстрой EMA (за последние 3 свечи)
-        # Это показывает "мощность" импульса
-        slope = abs(ema_f.iloc[-1] - ema_f.iloc[-4]) / ema_f.iloc[-4]
-
-        # 3. Логика входа с фильтром наклона
-        side = None
-        if f_prev <= s_prev and f_now > s_now:
-            if slope >= MIN_SLOPE:
-                side = "LONG"
-            else:
-                return f"Сигнал LONG пропущен: слабый наклон ({slope:.5f})"
         
-        elif f_prev >= s_prev and f_now < s_now:
-            if slope >= MIN_SLOPE:
-                side = "SHORT"
-            else:
-                return f"Сигнал SHORT пропущен: слабый наклон ({slope:.5f})"
+        # Наклон за 3 минуты (физика ускорения)
+        slope = abs(f_now - ema_f.iloc[-4]) / ema_f.iloc[-4]
 
-        if side:
-            execute_trade(client, side, closes[-1])
-            return f"Вход {side} подтвержден фильтром наклона!"
+        # Сигнал переворота
+        new_signal = None
+        if f_prev <= s_prev and f_now > s_now and slope >= MIN_SLOPE:
+            new_signal = "LONG"
+        elif f_prev >= s_prev and f_now < s_now and slope >= MIN_SLOPE:
+            new_signal = "SHORT"
 
-        return f"Мониторинг. Наклон: {slope:.5f} (Нужно > {MIN_SLOPE})"
+        # 2. Проверяем текущий статус
+        pos = client.futures_position_information(symbol=SYMBOL)
+        active = [p for p in pos if float(p['positionAmt']) != 0]
+        
+        if active:
+            p = active[0]
+            amt = float(p['positionAmt'])
+            current_side = "LONG" if amt > 0 else "SHORT"
+            
+            # РЕВЕРС: Если сигнал сменился - переворачиваем «тапки»
+            if new_signal and new_signal != current_side:
+                # Закрываем всё старое
+                client.futures_create_order(symbol=SYMBOL, side='SELL' if amt > 0 else 'BUY', 
+                                          type='MARKET', quantity=abs(amt), reduceOnly=True)
+                client.futures_cancel_all_open_orders(symbol=SYMBOL)
+                
+                # Открываем новое
+                execute_trade(client, new_signal, closes[-1])
+                send_tg(f"🔄 *SOL REVERSE*: {current_side} ➡️ {new_signal}\n📐 Наклон: `{slope:.5f}`")
+                return f"Reverse to {new_signal}"
+            
+            return f"Держу {current_side}. Наклон: {slope:.5f}"
+
+        # 3. Если позиции нет - заходим
+        if new_signal:
+            execute_trade(client, new_signal, closes[-1])
+            return f"Вход SOL: {new_signal}"
+
+        return f"Поиск импульса SOL... Наклон: {slope:.5f}"
 
     except Exception as e:
         return f"Error: {e}", 400
 
 def execute_trade(client, side, price):
+    # Ставим плечо
     client.futures_change_leverage(symbol=SYMBOL, leverage=LEVERAGE)
-    qty = round(75 / price, 3)
     
-    # Рыночный вход для скорости
-    client.futures_create_order(symbol=SYMBOL, side='BUY' if side=="LONG" else 'SELL', type='MARKET', quantity=qty)
+    # Расчет объема исходя из ставки 1$ и плеча 75
+    qty = round((MARGIN_USDC * LEVERAGE) / price, 2)
+    
+    # Вход по рынку
+    client.futures_create_order(symbol=SYMBOL, side='BUY' if side=="LONG" else 'SELL', 
+                               type='MARKET', quantity=qty)
 
-    sl = round(price * (1 - SL_PCT) if side == "LONG" else price * (1 + SL_PCT), 2)
-    tp = round(price * (1 + TP_PCT) if side == "LONG" else price * (1 - TP_PCT), 2)
+    # Аварийный стоп 3% (чтобы не ликвидировало при сбое связи)
+    sl_price = round(price * (1 - EMERGENCY_SL) if side == "LONG" else price * (1 + EMERGENCY_SL), 2)
+    client.futures_create_order(symbol=SYMBOL, side='SELL' if side=="LONG" else 'BUY', 
+                               type='STOP_MARKET', stopPrice=str(sl_price), quantity=qty, reduceOnly=True)
 
-    # Защитные ордера
-    side_close = 'SELL' if side=="LONG" else 'BUY'
-    client.futures_create_order(symbol=SYMBOL, side=side_close, type='LIMIT', timeInForce='GTC', price=str(tp), quantity=qty, reduceOnly=True)
-    client.futures_create_order(symbol=SYMBOL, side=side_close, type='STOP_MARKET', stopPrice=str(sl), quantity=qty, reduceOnly=True)
-
-    send_tg(f"⚡️ *СУПЕР СКАЛЬПЕР: ВХОД {side}*\n📐 Наклон подтвержден\n🎯 TP: `{tp}`\n🛡 SL: `{sl}`")
+    send_tg(f"🚀 *ВХОД SOL {side}*\n💰 Ставка: `{MARGIN_USDC}$` (75x)\n🛡 Стоп: `{sl_price}`")
 
 if __name__ == "__main__":
     app.run(host='0.0.0.0', port=10000)
