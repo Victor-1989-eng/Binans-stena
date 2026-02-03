@@ -1,6 +1,1 @@
-ccxt
-pandas
-requests
-flask
-numpy
-pyTelegramBotAPI
+
