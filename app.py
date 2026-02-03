@@ -10,7 +10,7 @@ app = Flask(__name__)
 # --- ИТОГОВЫЕ НАСТРОЙКИ ---
 SYMBOL = 'BNBUSDC'  
 LEVERAGE = 75
-WALL_SIZE = 900     
+WALL_SIZE = 500     
 RANGE_MAX = 0.015
 AGGREGATION = 0.5
 STATS_FILE = "stats_v2.txt"
