@@ -8,7 +8,7 @@ from binance.exceptions import BinanceAPIException
 app = Flask(__name__)
 
 # --- ГЕОМЕТРИЯ ГЕНИЯ v5.2 (15m Edition) ---
-SYMBOLS = ['SOLUSDC', 'BTCUSDC', 'ETHUSDC']
+SYMBOLS = ['SOLUSDC', 'BTCUSDC', 'ETHUSDC', 'BNBUSDC']
 TIMEFRAME = '15m'  # ТЕПЕРЬ 15 МИНУТ
 LEVERAGE = 75
 MARGIN_USDC = 1.0 
