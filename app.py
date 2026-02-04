@@ -5,25 +5,18 @@ from binance.client import Client
 
 app = Flask(__name__)
 
-# --- НАСТРОЙКИ ---
+# --- КОНФИГУРАЦИЯ MICRO-SCALPER v7.1 ---
 SYMBOLS = ['SOLUSDC', 'BTCUSDC', 'ETHUSDC', 'BNBUSDC']
 LEVERAGE = 75
 MARGIN_USDC = 1.0 
-TF_ENTRY = '15m' 
-TF_EXIT = '1m'   
+TF = '1m'            
+PROFIT_TARGET = 0.22 # Ставим 22 цента (20 чистыми + запас на комиссию входа)
 EMA_FAST = 7    
-EMA_MED = 25    
 EMA_SLOW = 99   
-MIN_GAP = 0.0004 
-
-# Глобальные переменные управления
-is_running = True  # Состояние бота (Вкл/Выкл)
-fix_counts = {s: 0 for s in SYMBOLS}
-ready_to_fix = {s: True for s in SYMBOLS}
+# ---------------------------------------
 
 client = Client(os.environ.get("BINANCE_API_KEY"), os.environ.get("BINANCE_API_SECRET"))
 
-# --- ФУНКЦИИ TELEGRAM ---
 def send_tg(text):
     token = os.environ.get("TELEGRAM_TOKEN")
     chat_id = os.environ.get("CHAT_ID")
@@ -32,134 +25,88 @@ def send_tg(text):
         try: requests.post(url, json={"chat_id": chat_id, "text": text, "parse_mode": "Markdown"})
         except: pass
 
-def handle_commands():
-    """Фоновый поток для чтения команд из Telegram"""
-    global is_running
-    token = os.environ.get("TELEGRAM_TOKEN")
-    last_update_id = 0
-    
-    print("🤖 Командный центр Telegram запущен")
-    
-    while True:
-        try:
-            url = f"https://api.telegram.org/bot{token}/getUpdates?offset={last_update_id + 1}&timeout=30"
-            response = requests.get(url).json()
-            
-            if "result" in response:
-                for update in response["result"]:
-                    last_update_id = update["update_id"]
-                    if "message" in update and "text" in update["message"]:
-                        cmd = update["message"]["text"].lower()
-                        
-                        if cmd == "/stop":
-                            is_running = False
-                            # Принудительно закрываем всё при стопе
-                            emergency_close_all()
-                            send_tg("⛔️ *БОТ ОСТАНОВЛЕН*\nВсе позиции закрыты, сканер выключен.")
-                        
-                        elif cmd == "/start":
-                            is_running = True
-                            send_tg("✅ *БОТ ЗАПУЩЕН*\nНачинаю поиск сигналов на 15м...")
-                        
-                        elif cmd == "/status":
-                            status = "РАБОТАЕТ" if is_running else "СПИТ"
-                            send_tg(f"ℹ️ *СТАТУС*: `{status}`\nПлечо: `{LEVERAGE}x`\nДепозит: `${MARGIN_USDC}`")
-        except:
-            time.sleep(5)
-
-def emergency_close_all():
-    """Закрыть все позиции по всем символам сразу"""
-    for symbol in SYMBOLS:
-        try:
-            pos = client.futures_position_information(symbol=symbol)
-            active = [p for p in pos if float(p['positionAmt']) != 0]
-            if active:
-                amt = float(active[0]['positionAmt'])
-                side = 'SELL' if amt > 0 else 'BUY'
-                client.futures_create_order(symbol=symbol, side=side, type='MARKET', quantity=abs(amt), reduceOnly=True)
-        except Exception as e: print(f"Error during emergency close {symbol}: {e}")
-
-# --- ОСНОВНОЙ ЦИКЛ СКАНЕРА ---
-def get_ema_data(symbol, tf):
-    klines = client.futures_klines(symbol=symbol, interval=tf, limit=150)
+def get_ema(symbol):
+    klines = client.futures_klines(symbol=symbol, interval=TF, limit=110)
     closes = pd.Series([float(k[4]) for k in klines])
-    f = closes.ewm(span=EMA_FAST, adjust=False).mean().iloc[-1]
-    m = closes.ewm(span=EMA_MED, adjust=False).mean().iloc[-1]
-    s = closes.ewm(span=EMA_SLOW, adjust=False).mean().iloc[-1]
-    f_prev = closes.ewm(span=EMA_FAST, adjust=False).mean().iloc[-2]
-    s_prev = closes.ewm(span=EMA_SLOW, adjust=False).mean().iloc[-2]
-    return f, m, s, f_prev, s_prev
+    f = closes.ewm(span=EMA_FAST, adjust=False).mean()
+    s = closes.ewm(span=EMA_SLOW, adjust=False).mean()
+    return f.iloc[-1], f.iloc[-2], s.iloc[-1], s.iloc[-2]
 
 def run_scanner():
+    print("🚀 Micro-Scalper v7.1 запущен! Цель: +20 центов.")
+    send_tg("🚀 *Micro-Scalper v7.1 ЗАПУЩЕН*\nЦель: +0.20$ (Лимитный выход)\nТаймфрейм: 1м")
+
     while True:
-        if not is_running:
-            time.sleep(5)
-            continue
-            
         for symbol in SYMBOLS:
             try:
                 pos = client.futures_position_information(symbol=symbol)
                 active = [p for p in pos if float(p['positionAmt']) != 0]
 
-                if active:
-                    f1, m1, s1, _, _ = get_ema_data(symbol, TF_EXIT)
-                    p = active[0]
-                    amt = float(p['positionAmt'])
-                    side = "LONG" if amt > 0 else "SHORT"
+                if not active:
+                    f_now, f_prev, s_now, s_prev = get_ema(symbol)
                     
-                    # 🚨 АВАРИЯ
-                    if (side == "LONG" and f1 <= s1) or (side == "SHORT" and f1 >= s1):
-                        client.futures_create_order(symbol=symbol, side='SELL' if side=="LONG" else 'BUY', 
-                                                  type='MARKET', quantity=abs(amt), reduceOnly=True)
-                        fix_counts[symbol] = 0
-                        send_tg(f"🚨 *{symbol}* АВАРИЯ! Позиция закрыта.")
-                        continue
+                    side = None
+                    if f_prev <= s_prev and f_now > s_now: side = "LONG"
+                    elif f_prev >= s_prev and f_now < s_now: side = "SHORT"
 
-                    if (side == "LONG" and f1 > m1) or (side == "SHORT" and f1 < m1):
-                        ready_to_fix[symbol] = True
-
-                    if ((side == "LONG" and f1 < m1) or (side == "SHORT" and f1 > m1)) and ready_to_fix[symbol]:
-                        if fix_counts[symbol] < 5:
-                            fix_counts[symbol] += 1
-                            ready_to_fix[symbol] = False
-                            qty_to_close = abs(amt) * 0.2 if fix_counts[symbol] < 5 else abs(amt)
-                            
-                            if "BTC" in symbol: qty_to_close = round(qty_to_close, 3)
-                            elif "ETH" in symbol: qty_to_close = round(qty_to_close, 2)
-                            else: qty_to_close = round(qty_to_close, 1)
-
-                            client.futures_create_order(symbol=symbol, side='SELL' if side=="LONG" else 'BUY', 
-                                                      type='MARKET', quantity=qty_to_close, reduceOnly=True)
-                            send_tg(f"💵 *{symbol}* Фикс №{fix_counts[symbol]} (20%)")
+                    if side:
+                        execute_scalp_trade(symbol, side)
+                
                 else:
-                    fix_counts[symbol] = 0
-                    ready_to_fix[symbol] = True
-                    f15, _, s15, f15_prev, s15_prev = get_ema_data(symbol, TF_ENTRY)
-                    gap = abs(f15 - s15) / s15
-                    if f15_prev <= s15_prev and f15 > s15 and gap >= MIN_GAP:
-                        execute_trade(symbol, "LONG")
-                    elif f15_prev >= s15_prev and f15 < s15 and gap >= MIN_GAP:
-                        execute_trade(symbol, "SHORT")
-            except Exception as e: print(f"Ошибка {symbol}: {e}")
+                    # Аварийный контроль: если 7-я EMA пробивает 99-ю в обратную сторону
+                    f_now, _, s_now, _ = get_ema(symbol)
+                    amt = float(active[0]['positionAmt'])
+                    if (amt > 0 and f_now < s_now) or (amt < 0 and f_now > s_now):
+                        client.futures_cancel_all_open_orders(symbol=symbol)
+                        client.futures_create_order(symbol=symbol, side='SELL' if amt > 0 else 'BUY', 
+                                                  type='MARKET', quantity=abs(amt), reduceOnly=True)
+                        send_tg(f"⚠️ *{symbol}* Аварийный выход (разворот тренда).")
+
+            except Exception as e:
+                print(f"Ошибка {symbol}: {e}")
             time.sleep(1)
 
-def execute_trade(symbol, side):
-    price = float(client.futures_symbol_ticker(symbol=symbol)['price'])
+def execute_scalp_trade(symbol, side):
+    # 1. Рыночный вход
+    price_info = client.futures_symbol_ticker(symbol=symbol)
+    price = float(price_info['price'])
     qty = (MARGIN_USDC * LEVERAGE) / price
+    
     if "BTC" in symbol: qty = round(qty, 3)
     elif "ETH" in symbol: qty = round(qty, 2)
     else: qty = round(qty, 1)
-    try:
-        client.futures_create_order(symbol=symbol, side='BUY' if side=="LONG" else 'SELL', type='MARKET', quantity=qty)
-        send_tg(f"🚀 *{symbol}* ВХОД {side}")
-    except Exception as e: print(f"Error: {e}")
 
-# Запуск потоков
+    try:
+        order = client.futures_create_order(symbol=symbol, side='BUY' if side=="LONG" else 'SELL', 
+                                          type='MARKET', quantity=qty)
+        # Получаем реальную цену исполнения из ордера
+        entry_price = float(order['avgPrice']) if 'avgPrice' in order and float(order['avgPrice']) > 0 else price
+        
+        # 2. Выставляем лимитку на продажу (Maker 0%)
+        # Считаем смещение цены для профита $0.20
+        price_offset = PROFIT_TARGET / qty
+        tp_price = entry_price + price_offset if side == "LONG" else entry_price - price_offset
+        
+        # Округление цены под тики биржи (автоматизация округления)
+        if "BTC" in symbol: tp_price = round(tp_price, 2)
+        elif "ETH" in symbol: tp_price = round(tp_price, 2)
+        else: tp_price = round(tp_price, 3)
+
+        client.futures_create_order(
+            symbol=symbol, side='SELL' if side=="LONG" else 'BUY',
+            type='LIMIT', timeInForce='GTC', quantity=qty,
+            price=tp_price, reduceOnly=True
+        )
+        
+        send_tg(f"📥 *{symbol}* {side} по `{entry_price}`\n🎯 Тейк-лимитка: `{tp_price}`")
+    
+    except Exception as e:
+        print(f"Ошибка ордера: {e}")
+
 threading.Thread(target=run_scanner, daemon=True).start()
-threading.Thread(target=handle_commands, daemon=True).start()
 
 @app.route('/')
-def health(): return "Genius v6.2 Active"
+def health(): return "Scalper 7.1 Active"
 
 if __name__ == "__main__":
     app.run(host='0.0.0.0', port=10000)
