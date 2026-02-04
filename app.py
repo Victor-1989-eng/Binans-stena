@@ -19,7 +19,7 @@ APPROX_ENTRY_FEE = 0.03
 TOTAL_TARGET = NET_PROFIT_TARGET + APPROX_ENTRY_FEE 
 
 # --- ФИЛЬТР ЗАЗОРА ---
-GAP_THRESHOLD = 0.0003  # 0.1% зазор между EMA (чтобы избежать ложных входов)
+GAP_THRESHOLD = 0.0006  # 0.1% зазор между EMA (чтобы избежать ложных входов)
 
 EMA_FAST = 7    
 EMA_SLOW = 25   
