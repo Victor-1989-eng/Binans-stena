@@ -14,15 +14,15 @@ SYMBOLS = [
 LEVERAGE = 75
 MARGIN_USDC = 1.0 
 TF = '1m'            
-NET_PROFIT_TARGET = 0.20 
-APPROX_ENTRY_FEE = 0.04  
+NET_PROFIT_TARGET = 0.07 
+APPROX_ENTRY_FEE = 0.03  
 TOTAL_TARGET = NET_PROFIT_TARGET + APPROX_ENTRY_FEE 
 
 # --- ФИЛЬТР ЗАЗОРА ---
-GAP_THRESHOLD = 0.0005  # 0.1% зазор между EMA (чтобы избежать ложных входов)
+GAP_THRESHOLD = 0.0003  # 0.1% зазор между EMA (чтобы избежать ложных входов)
 
 EMA_FAST = 7    
-EMA_SLOW = 99   
+EMA_SLOW = 25   
 
 client = Client(os.environ.get("BINANCE_API_KEY"), os.environ.get("BINANCE_API_SECRET"))
 
