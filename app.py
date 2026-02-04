@@ -12,7 +12,7 @@ MARGIN_USDC = 1.0
 TF = '1m'            
 PROFIT_TARGET = 0.20 # Ставим 22 цента (20 чистыми + запас на комиссию входа)
 EMA_FAST = 7    
-EMA_SLOW = 25   
+EMA_SLOW = 99   
 # ---------------------------------------
 
 client = Client(os.environ.get("BINANCE_API_KEY"), os.environ.get("BINANCE_API_SECRET"))
