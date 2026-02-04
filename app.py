@@ -8,8 +8,8 @@ app = Flask(__name__)
 # --- КОНФИГУРАЦИЯ v7.4 (PRECISION) ---
 SYMBOLS = [
     'BTCUSDC', 'ETHUSDC', 'SOLUSDC', 'BNBUSDC', 
-    'XRPUSDC', 'ADAUSDC', 'AVAXUSDC', 'DOTUSDC', 
-    'LINKUSDC', 'NEARUSDC'
+    'XRPUSDC', 'ENAUSDC', 'AVAXUSDC', 'ZECUSDC', 
+    'LINKUSDC', 'NEOUSDC'
 ]
 LEVERAGE = 75
 MARGIN_USDC = 1.0 
