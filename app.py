@@ -14,7 +14,7 @@ LEVERAGE = 75
 MARGIN_USDC = 1.0
 EMA_FAST = 7
 EMA_SLOW = 25
-MIN_GAP = 0.0006  # Зазор только для ВХОДА
+MIN_GAP = 0.0005  # Зазор только для ВХОДА
 # ---------------------------
 
 client = Client(os.environ.get("BINANCE_API_KEY"), os.environ.get("BINANCE_API_SECRET"))
