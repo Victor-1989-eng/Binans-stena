@@ -6,7 +6,7 @@ from binance.client import Client
 app = Flask(__name__)
 
 # --- КОНФИГУРАЦИЯ v7.5 ---
-SYMBOLS = ['BTCUSDC', 'ETHUSDC', 'SOLUSDC', 'BNBUSDC', 'XRPUSDC', 'ENAUSDC', 'AVAXUSDC', 'ZECUSDC', 'LINKUSDC', 'NEOUSDC']
+SYMBOLS = ['BTCUSDC', 'SOLUSDC']
 LEVERAGE = 75
 MARGIN_USDC = 1.0 
 TF = '1m'            
