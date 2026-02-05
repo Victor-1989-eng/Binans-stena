@@ -5,18 +5,12 @@ from binance.client import Client
 
 app = Flask(__name__)
 
-# --- КОНФИГУРАЦИЯ v7.5 ---
-SYMBOLS = ['BTCUSDC', 'SOLUSDC']
-LEVERAGE = 75
-MARGIN_USDC = 1.0 
-TF = '1m'            
-NET_PROFIT_TARGET = 0.10 
-APPROX_ENTRY_FEE = 0.04  
-TOTAL_TARGET = NET_PROFIT_TARGET + APPROX_ENTRY_FEE 
-GAP_THRESHOLD = 0.0006  # Зазор для 7/25
-
-EMA_FAST = 7    
-EMA_MED = 25   
+# --- ГЛОБАЛЬНЫЕ НАСТРОЙКИ ---
+MARGIN_USDC = 1.2 # Чуть поднял, чтобы проходить фильтры на большем числе пар
+PROFIT_PERCENT = 0.0025 
+EMA_FAST = 7
+EMA_SLOW = 99
+GAP_THRESHOLD = 0.001 
 
 client = Client(os.environ.get("BINANCE_API_KEY"), os.environ.get("BINANCE_API_SECRET"))
 
@@ -28,81 +22,118 @@ def send_tg(text):
         try: requests.post(url, json={"chat_id": chat_id, "text": text, "parse_mode": "Markdown"})
         except: pass
 
-def get_precisions(symbol):
-    """Узнаем точность монеты автоматически"""
-    info = client.futures_exchange_info()
-    s_info = next(item for item in info['symbols'] if item['symbol'] == symbol)
-    return int(s_info['quantityPrecision']), int(s_info['pricePrecision'])
-
-def get_ema(symbol):
-    klines = client.futures_klines(symbol=symbol, interval=TF, limit=50)
-    closes = pd.Series([float(k[4]) for k in klines])
-    f = closes.ewm(span=EMA_FAST, adjust=False).mean()
-    m = closes.ewm(span=EMA_MED, adjust=False).mean()
-    return f.iloc[-1], f.iloc[-2], m.iloc[-1], m.iloc[-2]
+def get_all_usdc_pairs():
+    """Сканирует биржу и находит все USDC пары, их плечи и лимиты"""
+    try:
+        info = client.futures_exchange_info()
+        usdc_pairs = []
+        for s in info['symbols']:
+            # Берем только USDC, которые торгуются (TRADING)
+            if s['symbol'].endswith('USDC') and s['status'] == 'TRADING':
+                min_notional = 5.0
+                for f in s['filters']:
+                    if f['filterType'] == 'NOTIONAL': min_notional = float(f['notional'])
+                
+                usdc_pairs.append({
+                    'symbol': s['symbol'],
+                    'q_prec': int(s['quantityPrecision']),
+                    'p_prec': int(s['pricePrecision']),
+                    'min_notional': min_notional
+                })
+        return usdc_pairs
+    except Exception as e:
+        print(f"Ошибка при получении списка пар: {e}")
+        return []
 
 def run_scanner():
-    print("🚀 Завод v7.5 IRON SHELL запущен!")
+    print("🔍 Инициализация Auto-Hunter v7.8...")
+    all_pairs = get_all_usdc_pairs()
+    send_tg(f"✅ Найдено {len(all_pairs)} пар USDC. Начинаю охоту по кругу!")
+
     while True:
-        for symbol in SYMBOLS:
-            try:
-                pos = client.futures_position_information(symbol=symbol)
-                active = [p for p in pos if float(p['positionAmt']) != 0]
+        try:
+            # 1. Проверяем, нет ли уже открытой позиции
+            pos_info = client.futures_position_information()
+            active = [p for p in pos_info if float(p['positionAmt']) != 0]
 
-                if not active:
-                    f_now, f_prev, m_now, m_prev = get_ema(symbol)
-                    gap = abs(f_now - m_now) / m_now
+            if active:
+                # Если позиция есть, ждем и проверяем на разворот (Аварию)
+                p = active[0]
+                symbol, amt = p['symbol'], float(p['positionAmt'])
+                
+                klines = client.futures_klines(symbol=symbol, interval='1m', limit=150)
+                closes = pd.Series([float(k[4]) for k in klines])
+                f_now = closes.ewm(span=EMA_FAST, adjust=False).mean().iloc[-1]
+                s_now = closes.ewm(span=EMA_SLOW, adjust=False).mean().iloc[-1]
+
+                if (amt > 0 and f_now < s_now) or (amt < 0 and f_now > s_now):
+                    client.futures_cancel_all_open_orders(symbol=symbol)
+                    client.futures_create_order(symbol=symbol, side='SELL' if amt > 0 else 'BUY', 
+                                              type='MARKET', quantity=abs(amt), reduceOnly=True)
+                    send_tg(f"⚠️ *{symbol}* Закрыто по Аварии (разворот тренда)")
+                
+                time.sleep(10)
+                continue
+
+            # 2. Если позиций нет, идем по кругу всех пар
+            for pair in all_pairs:
+                symbol = pair['symbol']
+                
+                # Получаем данные
+                klines = client.futures_klines(symbol=symbol, interval='1m', limit=150)
+                closes = pd.Series([float(k[4]) for k in klines])
+                f = closes.ewm(span=EMA_FAST, adjust=False).mean()
+                s = closes.ewm(span=EMA_SLOW, adjust=False).mean()
+                
+                f_now, f_prev = f.iloc[-1], f.iloc[-2]
+                s_now, s_prev = s.iloc[-1], s.iloc[-2]
+                gap = abs(f_now - s_now) / s_now
+
+                side = None
+                if f_prev <= s_prev and f_now > s_now and gap >= GAP_THRESHOLD: side = "LONG"
+                elif f_prev >= s_prev and f_now < s_now and gap >= GAP_THRESHOLD: side = "SHORT"
+
+                if side:
+                    # Узнаем макс. плечо для этой конкретной пары
+                    brackets = client.futures_leverage_bracket(symbol=symbol)
+                    max_leverage = int(brackets[0]['brackets'][0]['initialLeverage'])
                     
-                    side = None
-                    if f_prev <= m_prev and f_now > m_now and gap >= GAP_THRESHOLD: side = "LONG"
-                    elif f_prev >= m_prev and f_now < m_now and gap >= GAP_THRESHOLD: side = "SHORT"
+                    # Пытаемся выставить плечо (если оно отличается)
+                    try: client.futures_change_leverage(symbol=symbol, leverage=max_leverage)
+                    except: pass
 
-                    if side: execute_trade(symbol, side)
-                else:
-                    # Аварийный выход при развороте
-                    f_now, _, m_now, _ = get_ema(symbol)
-                    amt = float(active[0]['positionAmt'])
-                    if (amt > 0 and f_now < m_now) or (amt < 0 and f_now > m_now):
-                        client.futures_cancel_all_open_orders(symbol=symbol)
-                        client.futures_create_order(symbol=symbol, side='SELL' if amt > 0 else 'BUY', 
-                                                  type='MARKET', quantity=abs(amt), reduceOnly=True)
-                        send_tg(f"⚠️ *{symbol}* Авария (разворот)")
-            except Exception as e: print(f"Ошибка сканера {symbol}: {e}")
-            time.sleep(0.5)
+                    price = float(client.futures_symbol_ticker(symbol=symbol)['price'])
+                    total_vol = MARGIN_USDC * max_leverage
 
-def execute_trade(symbol, side):
-    try:
-        q_prec, p_prec = get_precisions(symbol)
-        price_ticker = float(client.futures_symbol_ticker(symbol=symbol)['price'])
-        qty = round((MARGIN_USDC * LEVERAGE) / price_ticker, q_prec)
+                    if total_vol < pair['min_notional']:
+                        continue # Пропускаем, если объема не хватает
 
-        # Вход по рынку
-        order = client.futures_create_order(symbol=symbol, side='BUY' if side=="LONG" else 'SELL', type='MARKET', quantity=qty)
-        entry_price = float(order['avgPrice']) if 'avgPrice' in order and float(order['avgPrice']) > 0 else price_ticker
+                    # ВХОД
+                    qty = round(total_vol / price, pair['q_prec'])
+                    order = client.futures_create_order(symbol=symbol, side='BUY' if side=="LONG" else 'SELL', 
+                                                      type='MARKET', quantity=qty)
+                    entry_price = float(order['avgPrice']) if 'avgPrice' in order else price
 
-        # Расчет тейка
-        price_offset = TOTAL_TARGET / qty
-        tp_price = round(entry_price + price_offset if side == "LONG" else entry_price - price_offset, p_prec)
+                    # ТЕЙК
+                    dist = entry_price * PROFIT_PERCENT
+                    tp_price = round(entry_price + dist if side == "LONG" else entry_price - dist, pair['p_prec'])
+                    
+                    client.futures_create_order(symbol=symbol, side='SELL' if side=="LONG" else 'BUY',
+                                              type='LIMIT', timeInForce='GTC', quantity=qty, price=tp_price, reduceOnly=True)
+                    
+                    send_tg(f"🎯 *ВХОД {symbol}* (Плечо {max_leverage}x)\nВход: `{entry_price}`\nТейк: `{tp_price}`")
+                    break # Зашли в сделку — выходим из цикла поиска пар
 
-        # Цикл защиты: пытаемся поставить лимитку 5 раз
-        for attempt in range(5):
-            try:
-                client.futures_create_order(symbol=symbol, side='SELL' if side=="LONG" else 'BUY',
-                    type='LIMIT', timeInForce='GTC', quantity=qty, price=tp_price, reduceOnly=True)
-                send_tg(f"✅ *{symbol}* {side}\nВход: `{entry_price}`\nТейк: `{tp_price}`")
-                return # Выходим из функции, если всё ок
-            except Exception as e:
-                print(f"Попытка {attempt+1} тейка {symbol} провалена: {e}")
-                time.sleep(1)
-        
-        send_tg(f"🚨 КРИТИЧЕСКАЯ ОШИБКА: Тейк для {symbol} НЕ ПОСТАВЛЕН!")
+                time.sleep(1.2) # Чтобы не словить бан IP
 
-    except Exception as e: print(f"Ошибка входа {symbol}: {e}")
+        except Exception as e:
+            print(f"Ошибка в цикле: {e}")
+            time.sleep(30) # При ошибке (например, интернет) отдыхаем
 
 threading.Thread(target=run_scanner, daemon=True).start()
 
 @app.route('/')
-def health(): return "Iron Shell 7.5 Active"
+def health(): return "Auto-Hunter 7.8 Active"
 
 if __name__ == "__main__":
     app.run(host='0.0.0.0', port=10000)
