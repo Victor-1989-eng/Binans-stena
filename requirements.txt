@@ -3,6 +3,3 @@ flask
 requests
 gunicorn
 numpy
-Twisted
-pyOpenSSL
-service_identity
