@@ -8,7 +8,7 @@ app = Flask(__name__)
 # --- НАСТРОЙКИ ---
 SYMBOL = 'BNBUSDC'
 LEVERAGE = 50
-MARGIN_USDC = 2.0
+MARGIN_USDC = 1.0
 EMA_FAST = 7
 EMA_SLOW = 99
 
