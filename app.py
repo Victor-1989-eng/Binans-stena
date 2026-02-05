@@ -21,7 +21,7 @@ MARGIN_USDC = 1.2
 PROFIT_PERCENT = 0.0035 
 EMA_FAST = 7
 EMA_SLOW = 99
-GAP_THRESHOLD = 0.001 
+GAP_THRESHOLD = 0.0006 
 
 active_symbol = None
 ema_cache = {}
