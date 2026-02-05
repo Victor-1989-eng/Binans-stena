@@ -1,31 +1,26 @@
 import os, time, requests, sys, threading
 import numpy as np
 from flask import Flask
-
-try:
-    from binance.client import Client
-    try:
-        from binance.streams import ThreadedWebsocketManager
-    except ImportError:
-        from binance import ThreadedWebsocketManager
-except ImportError as e:
-    print(f"❌ Ошибка импорта: {e}")
-    sys.exit(1)
+from binance.client import Client
+from binance.streams import ThreadedWebsocketManager
 
 app = Flask(__name__)
 
-# --- НАСТРОЙКИ ---
-LEVERAGE = 75
-MARGIN_USDC = 1.2 
-PROFIT_PERCENT = 0.0025 
+# --- НАСТРОЙКИ BNB ---
+SYMBOL = 'BNBUSDC'
+LEVERAGE = 50
+MARGIN_USDC = 2.0
 EMA_FAST = 7
 EMA_SLOW = 99
-GAP_THRESHOLD = 0.0005 # Снизил до 0.05%
 
-active_symbol = None
-ema_cache = {}
-usdc_pairs_info = {}
+class BotState:
+    def __init__(self):
+        self.active_pos = None  # 'LONG', 'SHORT'
+        self.current_tf = '1m'  # Рабочий таймфрейм для выхода
+        self.ema_data = {'1m': {}, '3m': {}, '5m': {}}
+        self.entry_price = 0
 
+state = BotState()
 client = Client(os.environ.get("BINANCE_API_KEY"), os.environ.get("BINANCE_API_SECRET"))
 
 def send_tg(text):
@@ -36,172 +31,118 @@ def send_tg(text):
         try: requests.post(url, json={"chat_id": chat_id, "text": text, "parse_mode": "Markdown"})
         except: pass
 
-# --- МАТЕМАТИКА ---
-def calculate_initial_ema(values, span):
-    values = np.array(values)
+def get_ema(closes, span):
     alpha = 2 / (span + 1)
-    ema = values[0]
-    for value in values[1:]:
-        ema = (value * alpha) + (ema * (1 - alpha))
+    ema = closes[0]
+    for val in closes[1:]:
+        ema = (val * alpha) + (ema * (1 - alpha))
     return ema
 
-def update_ema(prev_ema, close_price, span):
+def update_ema(prev_ema, price, span):
     alpha = 2 / (span + 1)
-    return (close_price * alpha) + (prev_ema * (1 - alpha))
+    return (price * alpha) + (prev_ema * (1 - alpha))
 
-# --- ЛОГИКА ---
-def get_usdc_pairs():
-    try:
-        info = client.futures_exchange_info()
-        pairs = {}
-        trading_symbols = []
-        for s in info['symbols']:
-            if s['symbol'].endswith('USDC') and s['status'] == 'TRADING':
-                min_notional = 5.0
-                for f in s['filters']:
-                    if f['filterType'] == 'NOTIONAL': min_notional = float(f['notional'])
-                
-                if (MARGIN_USDC * LEVERAGE) >= min_notional:
-                    pairs[s['symbol']] = {
-                        'q_prec': int(s['quantityPrecision']),
-                        'p_prec': int(s['pricePrecision']),
-                        'min_notional': min_notional
-                    }
-                    trading_symbols.append(s['symbol'])
-        return pairs, trading_symbols
-    except Exception as e:
-        print(f"Ошибка получения пар: {e}")
-        return {}, []
-
-def initialize_market_data(symbols):
-    print(f"📊 Загрузка глубокой истории (500 свечей) для {len(symbols)} пар...")
-    count = 0
-    for symbol in symbols:
-        try:
-            # Берем 500 свечей для идеальной точности EMA 99
-            klines = client.futures_klines(symbol=symbol, interval='1m', limit=500)
-            closes = [float(k[4]) for k in klines]
-            
-            if len(closes) < 150: continue
-
-            ema_f = calculate_initial_ema(closes, EMA_FAST)
-            ema_s = calculate_initial_ema(closes, EMA_SLOW)
-            
-            ema_cache[symbol] = {'fast': ema_f, 'slow': ema_s, 'prev_fast': ema_f, 'prev_slow': ema_s}
-            count += 1
-            if count % 10 == 0: time.sleep(0.5)
-        except: continue
-    return count
+def init_all_tf():
+    send_tg("🔌 Инициализация BNB Матрешки...")
+    for tf in ['1m', '3m', '5m']:
+        klines = client.futures_klines(symbol=SYMBOL, interval=tf, limit=150)
+        closes = [float(k[4]) for k in klines]
+        state.ema_data[tf] = {
+            'fast': get_ema(closes, EMA_FAST),
+            'slow': get_ema(closes, EMA_SLOW)
+        }
+    send_tg(f"✅ Готов! Вход на 1м, трейлинг до 5м.")
 
 def handle_socket_message(msg):
-    global active_symbol
+    if 'e' not in msg or msg['e'] != 'kline': return
+    k = msg['k']
+    if k['s'] != SYMBOL: return
     
-    if not isinstance(msg, dict) or 'e' not in msg or 'k' not in msg: return
-    if msg['e'] != 'kline': return
-    kline = msg['k']
-    if not kline.get('x'): return 
-    
-    symbol = msg['s']
-    close_price = float(kline['c'])
-    
-    if symbol in ema_cache:
-        data = ema_cache[symbol]
-        data['prev_fast'], data['prev_slow'] = data['fast'], data['slow']
-        data['fast'] = update_ema(data['fast'], close_price, EMA_FAST)
-        data['slow'] = update_ema(data['slow'], close_price, EMA_SLOW)
-        
-        f_now, f_prev = data['fast'], data['prev_fast']
-        s_now, s_prev = data['slow'], data['prev_slow']
-        
-        # Проверка пересечения
-        side = None
-        if f_prev <= s_prev and f_now > s_now: side = "LONG"
-        elif f_prev >= s_prev and f_now < s_now: side = "SHORT"
-        
-        if side:
-            gap = abs(f_now - s_now) / s_now
-            print(f"🎯 КРЕСТ на {symbol}: {side} | Зазор: {gap:.6f} | Порог: {GAP_THRESHOLD}")
-            
-            if active_symbol:
-                print(f"🚫 Пропуск {symbol}: Уже открыта позиция {active_symbol}")
-                return
+    close_price = float(k['c'])
+    is_closed = k['x']
+    interval = k['i']
 
-            if gap >= GAP_THRESHOLD:
-                execute_trade(symbol, side, close_price)
-            else:
-                print(f"⏳ Пропуск {symbol}: Слишком малый зазор.")
+    # Обновляем EMA только по закрытию свечи
+    if is_closed and interval in state.ema_data:
+        d = state.ema_data[interval]
+        d['prev_fast'], d['prev_slow'] = d['fast'], d['slow']
+        d['fast'] = update_ema(d['fast'], close_price, EMA_FAST)
+        d['slow'] = update_ema(d['slow'], close_price, EMA_SLOW)
+        
+        # ЛОГИКА ВХОДА (1м)
+        if interval == '1m' and not state.active_pos:
+            if d['prev_fast'] <= d['prev_slow'] and d['fast'] > d['slow']:
+                execute_trade('LONG', close_price)
+            elif d['prev_fast'] >= d['prev_slow'] and d['fast'] < d['slow']:
+                execute_trade('SHORT', close_price)
 
-def execute_trade(symbol, side, price):
-    global active_symbol
+        # ЛОГИКА ВЫХОДА И ПЕРЕКЛЮЧЕНИЯ (Проверка каждую закрытую минуту)
+        if interval == '1m' and state.active_pos:
+            check_exit_and_upgrade(close_price)
+
+def execute_trade(side, price):
     try:
-        active_symbol = symbol 
-        info = usdc_pairs_info[symbol]
+        client.futures_change_leverage(symbol=SYMBOL, leverage=LEVERAGE)
+        qty = round((MARGIN_USDC * LEVERAGE) / price, 2) # Точность BNB
         
-        # Настройка плеча
-        try:
-            brackets = client.futures_leverage_bracket(symbol=symbol)
-            max_lev = int(brackets[0]['brackets'][0]['initialLeverage'])
-            client.futures_change_leverage(symbol=symbol, leverage=max_lev)
-        except: max_lev = LEVERAGE
-
-        qty = round((MARGIN_USDC * max_lev) / price, info['q_prec'])
+        client.futures_create_order(symbol=SYMBOL, side='BUY' if side=='LONG' else 'SELL', type='MARKET', quantity=qty)
         
-        # Проверка минимального объема
-        if (qty * price) < info['min_notional']:
-            print(f"❌ Объем {qty*price} меньше минимального {info['min_notional']} для {symbol}")
-            active_symbol = None
-            return
-
-        order = client.futures_create_order(symbol=symbol, side='BUY' if side=="LONG" else 'SELL', type='MARKET', quantity=qty)
-        entry_price = float(order.get('avgPrice', price))
-
-        dist = entry_price * PROFIT_PERCENT
-        tp_price = round(entry_price + dist if side == "LONG" else entry_price - dist, info['p_prec'])
-        
-        client.futures_create_order(symbol=symbol, side='SELL' if side=="LONG" else 'BUY',
-                                    type='LIMIT', timeInForce='GTC', quantity=qty, price=tp_price, reduceOnly=True)
-        
-        send_tg(f"🚀 *ВХОД {symbol}* ({side})\nПлечо: {max_lev}x\nЦена: `{entry_price}`\nТейк: `{tp_price}`")
+        state.active_pos = side
+        state.current_tf = '1m'
+        state.entry_price = price
+        send_tg(f"🚀 *ВХОД {side}* (BNB)\nЦена: `{price}`\nКонтроль: `1m`")
     except Exception as e:
-        print(f"Ошибка входа: {e}")
-        active_symbol = None
+        send_tg(f"❌ Ошибка входа: {e}")
 
-def position_monitor():
-    global active_symbol
-    while True:
-        if active_symbol:
-            try:
-                pos = client.futures_position_information(symbol=active_symbol)
-                if float(pos[0]['positionAmt']) == 0:
-                    send_tg(f"💰 *{active_symbol} закрыта!* Ищу новый вход...")
-                    active_symbol = None
-            except: pass
-        time.sleep(10)
+def check_exit_and_upgrade(price):
+    # 1. Проверяем возможность апгрейда таймфрейма
+    for tf in ['5m', '3m']:
+        ema_slow = state.ema_data[tf]['slow']
+        if (state.active_pos == 'LONG' and price > ema_slow) or \
+           (state.active_pos == 'SHORT' and price < ema_slow):
+            if tf != state.current_tf:
+                # Если мы "доросли" до старшего таймфрейма (3м или 5м)
+                if (tf == '5m' and state.current_tf in ['1m', '3m']) or (tf == '3m' and state.current_tf == '1m'):
+                    state.current_tf = tf
+                    send_tg(f"🔼 Уровень повышен! Контроль по `{tf}`")
+                break
+
+    # 2. Проверка выхода по текущему TF
+    current_slow = state.ema_data[state.current_tf]['slow']
+    should_exit = False
+    if state.active_pos == 'LONG' and price < current_slow: should_exit = True
+    elif state.active_pos == 'SHORT' and price > current_slow: should_exit = True
+    
+    if should_exit:
+        close_pos(price)
+
+def close_pos(price):
+    try:
+        pos = client.futures_position_information(symbol=SYMBOL)
+        qty = abs(float(pos[0]['positionAmt']))
+        if qty > 0:
+            side = 'SELL' if state.active_pos == 'LONG' else 'BUY'
+            client.futures_create_order(symbol=SYMBOL, side=side, type='MARKET', quantity=qty, reduceOnly=True)
+            res = "PROFIT" if (state.active_pos == 'LONG' and price > state.entry_price) or \
+                             (state.active_pos == 'SHORT' and price < state.entry_price) else "LOSS"
+            send_tg(f"🏁 *ВЫХОД BNB* ({res})\nТаймфрейм: `{state.current_tf}`\nЦена: `{price}`")
+        state.active_pos = None
+        state.current_tf = '1m'
+    except Exception as e:
+        send_tg(f"❌ Ошибка закрытия: {e}")
 
 def start_bot():
-    global usdc_pairs_info
-    usdc_pairs_info, symbols_list = get_usdc_pairs()
-    if not symbols_list: return
-    
-    send_tg(f"🤖 *SPEEDSTER v7.9.7 DEBUG*\nЗапуск сканера...")
-    count = initialize_market_data(symbols_list)
-    print(f"✅ Готово к работе с {count} парами.")
-
+    init_all_tf()
     twm = ThreadedWebsocketManager(api_key=os.environ.get("BINANCE_API_KEY"), api_secret=os.environ.get("BINANCE_API_SECRET"))
     twm.start()
-    streams = [f"{s.lower()}@kline_1m" for s in symbols_list]
-    twm.start_multiplex_socket(callback=handle_socket_message, streams=streams)
+    for tf in ['1m', '3m', '5m']:
+        twm.start_kline_socket(callback=handle_socket_message, symbol=SYMBOL, interval=tf)
     twm.join()
 
-def run_all():
-    time.sleep(2)
-    start_bot()
+@app.route('/')
+def health(): return "BNB Speedster Live"
 
 if __name__ == "__main__":
-    threading.Thread(target=position_monitor, daemon=True).start()
-    threading.Thread(target=run_all, daemon=True).start()
+    threading.Thread(target=lambda: (time.sleep(5), start_bot()), daemon=True).start()
     port = int(os.environ.get("PORT", 10000))
     app.run(host='0.0.0.0', port=port)
-
-@app.route('/')
-def health(): return "OK"
