@@ -2,7 +2,6 @@ import os, time, requests, sys, threading
 import numpy as np
 from flask import Flask
 
-# --- БЛОК БЕЗОПАСНОГО ИМПОРТА ---
 try:
     from binance.client import Client
     try:
@@ -18,10 +17,10 @@ app = Flask(__name__)
 # --- НАСТРОЙКИ ---
 LEVERAGE = 75
 MARGIN_USDC = 1.2 
-PROFIT_PERCENT = 0.0035 
+PROFIT_PERCENT = 0.0025 
 EMA_FAST = 7
 EMA_SLOW = 99
-GAP_THRESHOLD = 0.0006 
+GAP_THRESHOLD = 0.0005 # Снизил до 0.05%
 
 active_symbol = None
 ema_cache = {}
@@ -75,15 +74,19 @@ def get_usdc_pairs():
         return {}, []
 
 def initialize_market_data(symbols):
-    print(f"📊 Загрузка истории для {len(symbols)} пар...")
+    print(f"📊 Загрузка глубокой истории (500 свечей) для {len(symbols)} пар...")
     count = 0
     for symbol in symbols:
         try:
-            klines = client.futures_klines(symbol=symbol, interval='1m', limit=150)
+            # Берем 500 свечей для идеальной точности EMA 99
+            klines = client.futures_klines(symbol=symbol, interval='1m', limit=500)
             closes = [float(k[4]) for k in klines]
-            if len(closes) < 100: continue
+            
+            if len(closes) < 150: continue
+
             ema_f = calculate_initial_ema(closes, EMA_FAST)
             ema_s = calculate_initial_ema(closes, EMA_SLOW)
+            
             ema_cache[symbol] = {'fast': ema_f, 'slow': ema_s, 'prev_fast': ema_f, 'prev_slow': ema_s}
             count += 1
             if count % 10 == 0: time.sleep(0.5)
@@ -93,10 +96,7 @@ def initialize_market_data(symbols):
 def handle_socket_message(msg):
     global active_symbol
     
-    # ЗАЩИТА ОТ KeyError: 'e' и 'k'
-    if not isinstance(msg, dict) or 'e' not in msg or 'k' not in msg:
-        return
-        
+    if not isinstance(msg, dict) or 'e' not in msg or 'k' not in msg: return
     if msg['e'] != 'kline': return
     kline = msg['k']
     if not kline.get('x'): return 
@@ -104,8 +104,6 @@ def handle_socket_message(msg):
     symbol = msg['s']
     close_price = float(kline['c'])
     
-    if active_symbol: return
-
     if symbol in ema_cache:
         data = ema_cache[symbol]
         data['prev_fast'], data['prev_slow'] = data['fast'], data['slow']
@@ -114,21 +112,27 @@ def handle_socket_message(msg):
         
         f_now, f_prev = data['fast'], data['prev_fast']
         s_now, s_prev = data['slow'], data['prev_slow']
-        gap = abs(f_now - s_now) / s_now
         
+        # Проверка пересечения
         side = None
-        if f_prev <= s_prev and f_now > s_now and gap >= GAP_THRESHOLD: side = "LONG"
-        elif f_prev >= s_prev and f_now < s_now and gap >= GAP_THRESHOLD: side = "SHORT"
+        if f_prev <= s_prev and f_now > s_now: side = "LONG"
+        elif f_prev >= s_prev and f_now < s_now: side = "SHORT"
         
-        if side: execute_trade(symbol, side, close_price)
+        if side:
+            gap = abs(f_now - s_now) / s_now
+            print(f"🎯 КРЕСТ на {symbol}: {side} | Зазор: {gap:.6f} | Порог: {GAP_THRESHOLD}")
+            
+            if active_symbol:
+                print(f"🚫 Пропуск {symbol}: Уже открыта позиция {active_symbol}")
+                return
+
+            if gap >= GAP_THRESHOLD:
+                execute_trade(symbol, side, close_price)
+            else:
+                print(f"⏳ Пропуск {symbol}: Слишком малый зазор.")
 
 def execute_trade(symbol, side, price):
     global active_symbol
-    try:
-        pos = client.futures_position_information(symbol=symbol)
-        if float(pos[0]['positionAmt']) != 0: return 
-    except: return
-
     try:
         active_symbol = symbol 
         info = usdc_pairs_info[symbol]
@@ -142,11 +146,15 @@ def execute_trade(symbol, side, price):
 
         qty = round((MARGIN_USDC * max_lev) / price, info['q_prec'])
         
-        # Вход
+        # Проверка минимального объема
+        if (qty * price) < info['min_notional']:
+            print(f"❌ Объем {qty*price} меньше минимального {info['min_notional']} для {symbol}")
+            active_symbol = None
+            return
+
         order = client.futures_create_order(symbol=symbol, side='BUY' if side=="LONG" else 'SELL', type='MARKET', quantity=qty)
         entry_price = float(order.get('avgPrice', price))
 
-        # Тейк
         dist = entry_price * PROFIT_PERCENT
         tp_price = round(entry_price + dist if side == "LONG" else entry_price - dist, info['p_prec'])
         
@@ -174,10 +182,8 @@ def start_bot():
     global usdc_pairs_info
     usdc_pairs_info, symbols_list = get_usdc_pairs()
     if not symbols_list: return
-
-    msg_pairs = ", ".join([s.replace('USDC','') for s in symbols_list])
-    send_tg(f"🤖 *SPEEDSTER v7.9.6*\nАктивных пар: {len(symbols_list)}\n\n📝 {msg_pairs}")
     
+    send_tg(f"🤖 *SPEEDSTER v7.9.7 DEBUG*\nЗапуск сканера...")
     count = initialize_market_data(symbols_list)
     print(f"✅ Готово к работе с {count} парами.")
 
@@ -187,19 +193,13 @@ def start_bot():
     twm.start_multiplex_socket(callback=handle_socket_message, streams=streams)
     twm.join()
 
-# --- ВХОДНАЯ ТОЧКА ДЛЯ RENDER ---
 def run_all():
-    # Даем Flask запуститься, затем стартуем бота
     time.sleep(2)
     start_bot()
 
 if __name__ == "__main__":
-    # Мониторинг позиций в отдельном потоке
     threading.Thread(target=position_monitor, daemon=True).start()
-    # Логика бота в отдельном потоке
     threading.Thread(target=run_all, daemon=True).start()
-    
-    # Мгновенный запуск сервера для Render
     port = int(os.environ.get("PORT", 10000))
     app.run(host='0.0.0.0', port=port)
 
