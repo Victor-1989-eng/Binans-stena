@@ -1,27 +1,17 @@
-import os, time, requests, threading
-import numpy as np
+import os, time, threading, requests
 from flask import Flask
 from binance.client import Client
 
 app = Flask(__name__)
 
-# --- НАСТРОЙКИ SOL ---
+# --- НАСТРОЙКИ СНАЙПЕРА ---
 SYMBOL = 'SOLUSDC'
 LEVERAGE = 100
-MARGIN_USDC = 1.0
+MARGIN_USDC = 1.0  # Твой $1
 EMA_FAST = 7
 EMA_SLOW = 25
-TAKE_PROFIT_USD = 0.10  # Тейк-профит 10 центов от цены входа
+PROFIT_TARGET = 0.10  # Забираем 10 центов
 
-class BotState:
-    def __init__(self):
-        self.active_pos = None
-        self.ema_f = 0
-        self.ema_s = 0
-        self.prev_f = 0
-        self.prev_s = 0
-
-state = BotState()
 client = Client(os.environ.get("BINANCE_API_KEY"), os.environ.get("BINANCE_API_SECRET"))
 
 def send_tg(text):
@@ -29,95 +19,87 @@ def send_tg(text):
     chat_id = os.environ.get("CHAT_ID")
     if token and chat_id:
         url = f"https://api.telegram.org/bot{token}/sendMessage"
-        try: requests.post(url, json={"chat_id": chat_id, "text": text, "parse_mode": "Markdown"})
+        try: requests.post(url, json={"chat_id": chat_id, "text": text})
         except: pass
 
-def calculate_ema(prices, span):
+def get_ema(values, span):
+    if len(values) < span: return 0
     alpha = 2 / (span + 1)
-    ema = prices[0]
-    for p in prices[1:]:
-        ema = (p * alpha) + (ema * (1 - alpha))
+    ema = values[0]
+    for val in values[1:]:
+        ema = (val * alpha) + (ema * (1 - alpha))
     return ema
 
-def bot_worker():
-    send_tg(f"⚡ *SOL Sniper 100x* Запущен!\nПараметры: EMA {EMA_FAST}/{EMA_SLOW}, TP: ${TAKE_PROFIT_USD}")
+def run_sniper():
+    send_tg(f"🎯 *SOL Снайпер запущен!*\nМаржа: ${MARGIN_USDC}, Плечо: {LEVERAGE}x\nСтратегия: EMA {EMA_FAST}/{EMA_SLOW}, Тейк: {PROFIT_TARGET}$")
+    
+    prev_f, prev_s = 0, 0
     
     while True:
         try:
-            # Получаем свечи (100 штук достаточно для EMA 25)
-            klines = client.futures_klines(symbol=SYMBOL, interval='1m', limit=100)
-            closes = [float(k[4]) for k in klines[:-1]] # Закрытые
-            current_price = float(klines[-1][4]) # Текущая цена
-            
-            state.prev_f, state.prev_s = state.ema_f, state.ema_s
-            state.ema_f = calculate_ema(closes, EMA_FAST)
-            state.ema_s = calculate_ema(closes, EMA_SLOW)
-            
-            # Если позиции нет и данные инициализированы
-            if not state.active_pos and state.prev_f > 0:
+            # Получаем последние свечи
+            klines = client.futures_klines(symbol=SYMBOL, interval='1m', limit=50)
+            closes = [float(k[4]) for k in klines[:-1]] # Берем закрытые свечи
+            current_price = float(klines[-1][4])
+
+            f_now = get_ema(closes, EMA_FAST)
+            s_now = get_ema(closes, EMA_SLOW)
+
+            # Проверяем, есть ли уже открытая позиция
+            pos = client.futures_position_information(symbol=SYMBOL)
+            has_pos = any(float(p['positionAmt']) != 0 for p in pos if p['symbol'] == SYMBOL)
+
+            if not has_pos and prev_f > 0:
                 side = None
-                if state.prev_f <= state.prev_s and state.ema_f > state.ema_s:
-                    side = 'LONG'
-                elif state.prev_f >= state.prev_s and state.ema_f < state.ema_s:
-                    side = 'SHORT'
-                
+                # Сигнал пересечения
+                if prev_f <= prev_s and f_now > s_now:
+                    side = 'BUY'
+                elif prev_f >= prev_s and f_now < s_now:
+                    side = 'SELL'
+
                 if side:
                     execute_trade(side, current_price)
-            
-            # Проверка закрытия позиции (если она есть)
-            if state.active_pos:
-                check_position_status()
+
+            prev_f, prev_s = f_now, s_now
 
         except Exception as e:
-            print(f"Ошибка: {e}")
+            print(f"Ошибка цикла: {e}")
         
-        time.sleep(10) # Опрос каждые 10 секунд
+        time.sleep(10) # Проверка каждые 10 секунд
 
 def execute_trade(side, price):
     try:
-        # 1. Плечо
+        # Устанавливаем плечо
         client.futures_change_leverage(symbol=SYMBOL, leverage=LEVERAGE)
         
-        # 2. Количество (для SOL точность обычно 2 знака, например 0.15 SOL)
-        qty = round((MARGIN_USDC * LEVERAGE) / price, 2)
+        # Шаг 1: Считаем количество (для SOL 1 знак после запятой)
+        qty = round((MARGIN_USDC * LEVERAGE) / price, 1)
         
-        # 3. Вход по маркету
-        order = client.futures_create_order(symbol=SYMBOL, side='BUY' if side=='LONG' else 'SELL', type='MARKET', quantity=qty)
+        # Шаг 2: Вход по рынку
+        order = client.futures_create_order(symbol=SYMBOL, side=side, type='MARKET', quantity=qty)
         entry_price = float(order.get('avgPrice', price))
         
-        # 4. Тейк-профит (ровно +10 центов)
-        tp_price = round(entry_price + TAKE_PROFIT_USD if side == 'LONG' else entry_price - TAKE_PROFIT_USD, 3)
+        # Шаг 3: Выставляем Тейк-Профит (Лимитный ордер на выход)
+        tp_price = round(entry_price + PROFIT_TARGET if side == 'BUY' else entry_price - PROFIT_TARGET, 2)
         
         client.futures_create_order(
-            symbol=SYMBOL, 
-            side='SELL' if side=='LONG' else 'BUY', 
-            type='LIMIT', 
-            timeInForce='GTC', 
-            quantity=qty, 
-            price=tp_price, 
+            symbol=SYMBOL,
+            side='SELL' if side == 'BUY' else 'BUY',
+            type='LIMIT',
+            price=tp_price,
+            quantity=qty,
+            timeInForce='GTC',
             reduceOnly=True
         )
         
-        state.active_pos = side
-        send_tg(f"🚀 *ВХОД {side} SOL*\nЦена: `{entry_price}`\nТейк: `{tp_price}`")
+        send_tg(f"🚀 *ВХОД {side}*\nЦена: `{entry_price}`\nТейк: `{tp_price}`")
+        
     except Exception as e:
         send_tg(f"❌ Ошибка входа: {e}")
 
-def check_position_status():
-    try:
-        pos = client.futures_position_information(symbol=SYMBOL)
-        for p in pos:
-            if p['symbol'] == SYMBOL:
-                if float(p['positionAmt']) == 0:
-                    send_tg(f"💰 *SOL Сделка закрыта!* Жду новый сигнал...")
-                    state.active_pos = None
-                break
-    except: pass
-
 @app.route('/')
-def health(): return "SOL_SNIPER_OK"
+def health(): return "SOL_SNIPER_RUNNING"
 
 if __name__ == "__main__":
-    threading.Thread(target=bot_worker, daemon=True).start()
-    port = int(os.environ.get("PORT", 10000))
-    app.run(host='0.0.0.0', port=port)
+    threading.Thread(target=run_sniper, daemon=True).start()
+    app.run(host='0.0.0.0', port=int(os.environ.get("PORT", 10000)))
