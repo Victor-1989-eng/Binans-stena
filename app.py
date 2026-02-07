@@ -12,7 +12,7 @@ MARGIN_USDC = 1.0
 EMA_FAST = 7
 EMA_SLOW = 25
 PROFIT_TARGET = 0.10
-THRESHOLD = 0.0004
+THRESHOLD = 0.0002
 
 client = Client(
     os.environ.get("BINANCE_API_KEY"), 
