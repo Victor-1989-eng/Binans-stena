@@ -5,15 +5,16 @@ from binance.exceptions import BinanceAPIException
 
 app = Flask(__name__)
 
-# --- НАСТРОЙКИ ---
+# --- НАСТРОЙКИ СНАЙПЕРА ---
 SYMBOL = 'SOLUSDC'
 LEVERAGE = 100
-MARGIN_USDC = 1.0 
+MARGIN_USDC = 1.0       # Твоя маржа $1
 EMA_FAST = 7
 EMA_SLOW = 25
-PROFIT_TARGET = 0.10 
+PROFIT_TARGET = 0.10    # Тейк-профит 10 центов
+THRESHOLD = 0.0005      # Твой зазор (0.06% разницы между линиями)
 
-# Инициализация клиента с окном задержки (защита от ошибок времени)
+# Инициализация клиента (API ключи берутся из Environment Variables на Render)
 client = Client(
     os.environ.get("BINANCE_API_KEY"), 
     os.environ.get("BINANCE_API_SECRET"),
@@ -26,7 +27,7 @@ def send_tg(text):
     if token and chat_id:
         url = f"https://api.telegram.org/bot{token}/sendMessage"
         try:
-            res = requests.post(url, json={"chat_id": chat_id, "text": text})
+            res = requests.post(url, json={"chat_id": chat_id, "text": text, "parse_mode": "Markdown"})
             if res.status_code != 200: print(f"TG Error: {res.text}")
         except: pass
 
@@ -40,28 +41,35 @@ def get_ema(values, span):
 
 def run_sniper():
     print("🤖 Поток сканера запущен...")
-    send_tg("🎯 Бот вышел на охоту (SOLUSDC)")
+    send_tg(f"🎯 *SOL Снайпер активирован!*\nЗазор: `{THRESHOLD}`\nТейк: `{PROFIT_TARGET}$`")
     
     prev_f, prev_s = 0, 0
     
     while True:
         try:
-            # 1. Запрос данных (с увеличенным окном recvWindow)
+            # 1. Получаем свечи (минутки)
             klines = client.futures_klines(symbol=SYMBOL, interval='1m', limit=50, recvWindow=6000)
-            closes = [float(k[4]) for k in klines[:-1]]
+            closes = [float(k[4]) for k in klines[:-1]] # Только закрытые
             current_price = float(klines[-1][4])
 
             f_now = get_ema(closes, EMA_FAST)
             s_now = get_ema(closes, EMA_SLOW)
 
-            # 2. Проверка позиции
+            # 2. Проверяем наличие позиции
             pos = client.futures_position_information(symbol=SYMBOL, recvWindow=6000)
             has_pos = any(float(p['positionAmt']) != 0 for p in pos if p['symbol'] == SYMBOL)
 
+            # 3. Логика пересечения с зазором
             if not has_pos and prev_f > 0:
+                diff = (f_now - s_now) / s_now
                 side = None
-                if prev_f <= prev_s and f_now > s_now: side = 'BUY'
-                elif prev_f >= prev_s and f_now < s_now: side = 'SELL'
+
+                # ЛОНГ: 7 пересекла 25 вверх + разрыв больше порога
+                if f_now > s_now and diff >= THRESHOLD and prev_f <= prev_s:
+                    side = 'BUY'
+                # ШОРТ: 7 пересекла 25 вниз + разрыв больше порога
+                elif f_now < s_now and abs(diff) >= THRESHOLD and prev_f >= prev_s:
+                    side = 'SELL'
 
                 if side:
                     execute_trade(side, current_price)
@@ -69,38 +77,52 @@ def run_sniper():
             prev_f, prev_s = f_now, s_now
 
         except BinanceAPIException as e:
-            print(f"⚠️ Binance API Error: {e.status_code} - {e.message}")
+            print(f"⚠️ Binance Error: {e.message}")
         except Exception as e:
-            print(f"❌ Ошибка цикла: {e}")
+            print(f"❌ Ошибка: {e}")
         
-        time.sleep(15) # Чуть реже, чтобы не ловить бан за лимиты
+        time.sleep(15) # Пауза между проверками
 
 def execute_trade(side, price):
     try:
+        # Установка плеча
         client.futures_change_leverage(symbol=SYMBOL, leverage=LEVERAGE, recvWindow=6000)
+        
+        # Расчет объема (для SOL 1 знак после запятой)
         qty = round((MARGIN_USDC * LEVERAGE) / price, 1)
         
-        # Вход
-        client.futures_create_order(symbol=SYMBOL, side=side, type='MARKET', quantity=qty, recvWindow=6000)
+        # Вход по рынку
+        order = client.futures_create_order(symbol=SYMBOL, side=side, type='MARKET', quantity=qty, recvWindow=6000)
+        entry_price = float(order.get('avgPrice', price))
         
-        # Тейк
-        tp_price = round(price + PROFIT_TARGET if side == 'BUY' else price - PROFIT_TARGET, 2)
+        # Расчет и выставление Тейк-Профита (Лимитка)
+        tp_side = 'SELL' if side == 'BUY' else 'BUY'
+        tp_price = round(entry_price + PROFIT_TARGET if side == 'BUY' else entry_price - PROFIT_TARGET, 2)
+        
         client.futures_create_order(
-            symbol=SYMBOL, side='SELL' if side == 'BUY' else 'BUY',
-            type='LIMIT', price=tp_price, quantity=qty,
-            timeInForce='GTC', reduceOnly=True, recvWindow=6000
+            symbol=SYMBOL,
+            side=tp_side,
+            type='LIMIT',
+            price=tp_price,
+            quantity=qty,
+            timeInForce='GTC',
+            reduceOnly=True,
+            recvWindow=6000
         )
-        send_tg(f"🚀 ВХОД {side} по {price}. Тейк: {tp_price}")
+        
+        send_tg(f"🚀 *ВХОД {side}*\nЦена: `{entry_price}`\nТейк: `{tp_price}`")
+        
     except Exception as e:
-        print(f"Ошибка исполнения: {e}")
         send_tg(f"❌ Ошибка сделки: {e}")
 
-# Чтобы поток не запускался дважды при перезагрузках Flask
+# Защита от двойного запуска потока в Flask
 if not os.environ.get("WERKZEUG_RUN_MAIN") == "true":
     threading.Thread(target=run_sniper, daemon=True).start()
 
 @app.route('/')
-def health(): return "ACTIVE"
+def health(): return "SOL_SNIPER_ACTIVE"
 
 if __name__ == "__main__":
-    app.run(host='0.0.0.0', port=int(os.environ.get("PORT", 10000)))
+    # На Render порт берется из переменной окружения
+    port = int(os.environ.get("PORT", 10000))
+    app.run(host='0.0.0.0', port=port)
