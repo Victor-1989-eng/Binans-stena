@@ -8,10 +8,10 @@ app = Flask(__name__)
 # --- НАСТРОЙКИ ---
 SYMBOL = 'SOLUSDC'
 LEVERAGE = 100
-MARGIN_USDC = 1.0
-EMA_FAST = 7
-EMA_SLOW = 25
-PROFIT_TARGET = 0.10
+MARGIN_USDC = 0.25
+EMA_FAST = 25
+EMA_SLOW = 99
+PROFIT_TARGET = 0.50
 THRESHOLD = 0.0001
 
 client = Client(
