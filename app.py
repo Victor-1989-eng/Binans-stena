@@ -8,11 +8,11 @@ app = Flask(__name__)
 # --- НАСТРОЙКИ ---
 SYMBOL = os.environ.get("SYMBOL", "SOLUSDC")
 LEVERAGE = 100
-MARGIN_USDC = 1.0
+MARGIN_USDC = 0.10
 EMA_FAST = 7
 EMA_SLOW = 25
 THRESHOLD = 0.0003      # Уменьшил до 0.0004, чтобы быстрее ловить вход
-PROFIT_TARGET = 0.10
+PROFIT_TARGET = 0.20
 
 client = Client(
     os.environ.get("BINANCE_API_KEY"), 
