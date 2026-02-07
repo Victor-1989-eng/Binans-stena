@@ -1,156 +1,96 @@
 import os, time, threading, requests
 from flask import Flask
 from binance.client import Client
-from binance.exceptions import BinanceAPIException
 
 app = Flask(__name__)
 
-# --- НАСТРОЙКИ ---
+# --- НАСТРОЙКИ (ПОДБИРАЙ ПРОЦЕНТ) ---
 SYMBOL = os.environ.get("SYMBOL", "SOLUSDC")
-LEVERAGE = 100
-MARGIN_USDC = 0.10
-EMA_FAST = 7
-EMA_SLOW = 25
-THRESHOLD = 0.0003      # Уменьшил до 0.0004, чтобы быстрее ловить вход
-PROFIT_TARGET = 0.20
+THRESHOLD = 0.008       # 0.008 = 0.8%. Твой главный рычаг для проб.
+LEVERAGE = 5            # Плечо 5х (безопасно для реверса)
+MARGIN_USDC = 5.0       # Маржа на одну сделку
 
-client = Client(
-    os.environ.get("BINANCE_API_KEY"), 
-    os.environ.get("BINANCE_API_SECRET"),
-    {"verify": True, "timeout": 20}
-)
+client = Client(os.environ.get("BINANCE_API_KEY"), os.environ.get("BINANCE_API_SECRET"))
 
 def send_tg(text):
-    token = os.environ.get("TELEGRAM_TOKEN")
-    chat_id = os.environ.get("CHAT_ID")
+    token, chat_id = os.environ.get("TELEGRAM_TOKEN"), os.environ.get("CHAT_ID")
     if token and chat_id:
-        try:
-            requests.post(
-                f"https://api.telegram.org/bot{token}/sendMessage", 
-                json={"chat_id": chat_id, "text": f"[{SYMBOL}] {text}", "parse_mode": "Markdown"}
-            )
+        try: requests.post(f"https://api.telegram.org/bot{token}/sendMessage", 
+                           json={"chat_id": chat_id, "text": f"[{SYMBOL}] {text}", "parse_mode": "Markdown"})
         except: pass
 
 def get_ema(values, span):
     if len(values) < span: return 0
     alpha = 2 / (span + 1)
     ema = values[0]
-    for val in values[1:]:
-        ema = (val * alpha) + (ema * (1 - alpha))
+    for val in values[1:]: ema = (val * alpha) + (ema * (1 - alpha))
     return ema
 
-def run_sniper():
-    print(f"🤖 Скальпер 7/25 для {SYMBOL} запущен...")
-    send_tg(f"⚔️ *Бот 7/25 Обновлен!*\nЛогика: Липкий вход + Исправленный Тейк")
+def run_infinite_rebound():
+    print(f"🔄 Запущен ВЕЧНЫЙ РЕВЕРС на {SYMBOL}. Порог: {THRESHOLD*100}%")
+    send_tg(f"🤖 *Бот-Резинка запущен!*\nСимвол: `{SYMBOL}`\nПорог: `{THRESHOLD*100}%` (Маркет-вход/выход)")
     
-    prev_f, prev_s = 0, 0
-    last_signal_side = None 
-
     while True:
         try:
-            klines = client.futures_klines(symbol=SYMBOL, interval='1m', limit=50, recvWindow=60000)
+            # Получаем свечи (интервал 1м)
+            klines = client.futures_klines(symbol=SYMBOL, interval='1m', limit=50)
             closes = [float(k[4]) for k in klines[:-1]]
-            current_price = float(klines[-1][4])
+            curr_p = float(klines[-1][4])
 
-            f_now = get_ema(closes, EMA_FAST)
-            s_now = get_ema(closes, EMA_SLOW)
+            # Считаем EMA
+            f_now = get_ema(closes, 7)
+            s_now = get_ema(closes, 25)
+            
+            # Считаем зазор (отклонение быстрой от медленной)
+            diff = (f_now - s_now) / s_now
 
-            pos = client.futures_position_information(symbol=SYMBOL, recvWindow=60000)
+            # Проверяем текущую позицию
+            pos = client.futures_position_information(symbol=SYMBOL)
             active_pos = next((p for p in pos if p['symbol'] == SYMBOL and float(p['positionAmt']) != 0), None)
+            amt = float(active_pos['positionAmt']) if active_pos else 0
 
-            if active_pos:
-                # --- УМНЫЙ ВЫХОД (STOP REVERSAL) ---
-                amt = float(active_pos['positionAmt'])
-                diff = (f_now - s_now) / s_now
-                
-                if amt > 0 and f_now < s_now and abs(diff) >= THRESHOLD:
-                    close_position('SELL', "ОБРАТНЫЙ КРЕСТ (LONG EXIT)")
-                    last_signal_side = None 
-                
-                elif amt < 0 and f_now > s_now and diff >= THRESHOLD:
-                    close_position('BUY', "ОБРАТНЫЙ КРЕСТ (SHORT EXIT)")
-                    last_signal_side = None
+            # --- ЛОГИКА ПЕРЕВОРОТА РЫНОЧНЫМИ ОРДЕРАМИ ---
 
-            else:
-                # --- ЛИПКАЯ ЛОГИКА ВХОДА ---
-                if prev_f > 0:
-                    diff = (f_now - s_now) / s_now
-                    side = None
+            # Условие для ЛОНГА (цена внизу, резинка растянута вниз)
+            if f_now < s_now and abs(diff) >= THRESHOLD:
+                if amt <= 0: # Если мы в шорте или без позиции
+                    if amt < 0:
+                        execute_market_close('BUY', "ЗАКРЫТ ШОРТ (НИЖНИЙ ПИК)")
+                    execute_market_entry('BUY', curr_p)
 
-                    # Заходим, если есть зазор, даже если пересечение было раньше
-                    if f_now > s_now and diff >= THRESHOLD:
-                        if last_signal_side != 'BUY':
-                            side = 'BUY'
-                    
-                    elif f_now < s_now and abs(diff) >= THRESHOLD:
-                        if last_signal_side != 'SELL':
-                            side = 'SELL'
-
-                    if side:
-                        execute_trade(side, current_price)
-                        last_signal_side = side
-
-                    # Если линии пересеклись в обратную сторону без зазора - сбрасываем память
-                    if (f_now > s_now and prev_f <= prev_s) or (f_now < s_now and prev_f >= prev_s):
-                        if last_signal_side:
-                            print(f"Сигнал сменился, ждем новый зазор для {side}")
-
-            prev_f, prev_s = f_now, s_now
+            # Условие для ШОРТА (цена вверху, резинка растянута вверх)
+            elif f_now > s_now and diff >= THRESHOLD:
+                if amt >= 0: # Если мы в лонге или без позиции
+                    if amt > 0:
+                        execute_market_close('SELL', "ЗАКРЫТ ЛОНГ (ВЕРХНИЙ ПИК)")
+                    execute_market_entry('SELL', curr_p)
 
         except Exception as e:
-            print(f"❌ Ошибка цикла: {e}")
+            print(f"Ошибка в цикле: {e}")
         
-        time.sleep(15)
+        time.sleep(5) # Частота проверки рынка
 
-def execute_trade(side, price):
+def execute_market_entry(side, price):
     try:
-        client.futures_change_leverage(symbol=SYMBOL, leverage=LEVERAGE, recvWindow=60000)
-        
-        # Точность лота
-        info = client.futures_exchange_info()
-        s_info = next(i for i in info['symbols'] if i['symbol'] == SYMBOL)
-        step = float(next(f for f in s_info['filters'] if f['filterType'] == 'LOT_SIZE')['stepSize'])
-        precision = 0 if step >= 1 else len(str(step).split('.')[-1].rstrip('0'))
-        
-        qty = round((MARGIN_USDC * LEVERAGE) / price, precision)
-        
-        # 1. Маркет ордер
-        order = client.futures_create_order(symbol=SYMBOL, side=side, type='MARKET', quantity=qty, recvWindow=60000)
-        
-        # Берем цену исполнения из ответа биржи или используем текущую, если ответ пустой
-        avg_price = float(order.get('avgPrice', 0))
-        if avg_price == 0: avg_price = price
-        
-        # 2. Лимитный Тейк
-        tp_side = 'SELL' if side == 'BUY' else 'BUY'
-        tp_price = round(avg_price + PROFIT_TARGET if side == 'BUY' else avg_price - PROFIT_TARGET, 2)
-        
-        # ФИНАЛЬНАЯ ПРОВЕРКА ЦЕНЫ ПЕРЕД ОТПРАВКОЙ
-        if tp_price > 0:
-            client.futures_create_order(
-                symbol=SYMBOL, side=tp_side, type='LIMIT', price=tp_price, quantity=qty,
-                timeInForce='GTC', reduceOnly=True, recvWindow=60000
-            )
-            send_tg(f"🚀 *ВХОД {side}*\nЦена: `{avg_price}`\nТейк: `{tp_price}`")
-        else:
-            send_tg(f"⚠️ Ошибка расчета цены ТП: {tp_price}")
-
+        client.futures_change_leverage(symbol=SYMBOL, leverage=LEVERAGE)
+        qty = round((MARGIN_USDC * LEVERAGE) / price, 2)
+        client.futures_create_order(symbol=SYMBOL, side=side, type='MARKET', quantity=qty)
+        send_tg(f"🚀 *ВХОД {side}* по рынку. Цена: `{price}`")
     except Exception as e:
-        send_tg(f"❌ Ошибка входа: {str(e)}")
+        send_tg(f"❌ Ошибка входа: {e}")
 
-def close_position(side, reason):
+def execute_market_close(side, reason):
     try:
-        client.futures_cancel_all_open_orders(symbol=SYMBOL, recvWindow=60000)
-        pos = client.futures_position_information(symbol=SYMBOL, recvWindow=60000)
+        pos = client.futures_position_information(symbol=SYMBOL)
         qty = abs(float(next(p for p in pos if p['symbol'] == SYMBOL)['positionAmt']))
-        if qty > 0:
-            client.futures_create_order(symbol=SYMBOL, side=side, type='MARKET', quantity=qty, reduceOnly=True, recvWindow=60000)
-            send_tg(f"⚠️ *ВЫХОД:* {reason}")
+        client.futures_create_order(symbol=SYMBOL, side=side, type='MARKET', quantity=qty, reduceOnly=True)
+        send_tg(f"💰 {reason}")
     except Exception as e:
-        print(f"Err Close: {e}")
+        print(f"Ошибка закрытия: {e}")
 
+# Flask для поддержки жизни на хостинге
 if not os.environ.get("WERKZEUG_RUN_MAIN") == "true":
-    threading.Thread(target=run_sniper, daemon=True).start()
+    threading.Thread(target=run_infinite_rebound, daemon=True).start()
 
 @app.route('/')
 def health(): return "OK"
