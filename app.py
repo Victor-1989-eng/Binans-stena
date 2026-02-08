@@ -6,9 +6,9 @@ app = Flask(__name__)
 
 # --- НАСТРОЙКИ (ПОДБИРАЙ ПРОЦЕНТ) ---
 SYMBOL = os.environ.get("SYMBOL", "SOLUSDC")
-THRESHOLD = 0.008       # 0.008 = 0.8%. Твой главный рычаг для проб.
-LEVERAGE = 5            # Плечо 5х (безопасно для реверса)
-MARGIN_USDC = 5.0       # Маржа на одну сделку
+THRESHOLD = 0.0006       # 0.008 = 0.8%. Твой главный рычаг для проб.
+LEVERAGE = 10            # Плечо 5х (безопасно для реверса)
+MARGIN_USDC = 1.0       # Маржа на одну сделку
 
 client = Client(os.environ.get("BINANCE_API_KEY"), os.environ.get("BINANCE_API_SECRET"))
 
