@@ -3,3 +3,4 @@ pyTelegramBotAPI
 pandas
 numpy
 websocket-client
+gunicorn
