@@ -1,149 +1,223 @@
-import os, time, threading, requests
-from flask import Flask
-from binance.client import Client
+import os
+import json
+import ccxt
+import time
+import pandas as pd
+import telebot
+import websocket
+import threading
+from datetime import datetime
 
-app = Flask(__name__)
+# ================= 1. БЕРЕМ КЛЮЧИ ИЗ RENDER =================
+# Бот сам найдет их в Environment Variables
+API_KEY = os.getenv('API_KEY')
+SECRET_KEY = os.getenv('SECRET_KEY')
+BOT_TOKEN = os.getenv('BOT_TOKEN')
+CHAT_ID = os.getenv('CHAT_ID')
 
-# --- НАСТРОЙКИ ---
-SYMBOL = os.environ.get("SYMBOL", "SOLUSDC")
-THRESHOLD = 0.003       # 0.5% - Порог входа И переворота
-STEP_DIFF = 0.002       # 0.2% - Шаг усреднения (если тянет дальше)
-MAX_STEPS = 9           # Макс. кол-во усреднений (чтобы маржи хватило)
-LEVERAGE = 30            # Плечо
-MARGIN_STEP = 1.0       # Маржа на один ордер
+# Проверка, что ключи на месте
+if not API_KEY or not SECRET_KEY:
+    print("❌ ОШИБКА: Ключи не найдены в Environment Variables!")
+    exit()
 
-client = Client(os.environ.get("BINANCE_API_KEY"), os.environ.get("BINANCE_API_SECRET"))
+# ================= 2. НАСТРОЙКИ СТРАТЕГИИ =================
+SYMBOL_CCXT = 'SOL/USDC'   # Для ордеров
+SYMBOL_SOCKET = 'solusdc'  # Для сокета (маленькими)
+TIMEFRAME = '1m'
+LEVERAGE = 30              # Плечо 10 (для безопасности)
+QTY_USDT = 1               # Размер входа в $
+MAX_ORDERS = 6             # 6 шагов Деда
+GRID_STEP = 0.002          # 0.2% шаг усреднения
+THRESHOLD = 0.003          # 0.4% сигнал "Змеи"
 
-# Память
-current_steps = 0
-last_entry_diff = 0
+# ================= 3. ИНИЦИАЛИЗАЦИЯ =================
+exchange = ccxt.binanceusdm({
+    'apiKey': API_KEY,
+    'secret': SECRET_KEY,
+    'enableRateLimit': True
+})
+bot = telebot.TeleBot(BOT_TOKEN)
 
-def send_tg(text):
-    token, chat_id = os.environ.get("TELEGRAM_TOKEN"), os.environ.get("CHAT_ID")
-    if token and chat_id:
-        try: requests.post(f"https://api.telegram.org/bot{token}/sendMessage", 
-                           json={"chat_id": chat_id, "text": f"[{SYMBOL}] {text}", "parse_mode": "Markdown"})
-        except: pass
+# Глобальные переменные (Память бота)
+closes = []      # Список цен закрытия
+current_price = 0
+in_position = False 
+position_data = {} 
+last_trade_time = 0
 
-def get_ema(values, span):
-    if len(values) < span: return 0
-    alpha = 2 / (span + 1)
-    ema = values[0]
-    for val in values[1:]: ema = (val * alpha) + (ema * (1 - alpha))
-    return ema
+def log(message):
+    """Пишет в лог Render и в Телеграм"""
+    print(f"[{datetime.now().strftime('%H:%M:%S')}] {message}")
+    try:
+        bot.send_message(CHAT_ID, message)
+    except:
+        pass
 
-def run_swing_grid():
-    global current_steps, last_entry_diff
-    print(f"🔄 КАЧЕЛИ С УСРЕДНЕНИЕМ запущены. Порог: {THRESHOLD*100}%")
-    send_tg(f"🤖 *Бот-Качели (Flip+Grid)*\nПорог переворота: `{THRESHOLD*100}%`\nШаг усреднения: `{STEP_DIFF*100}%`")
+# ================= 4. ЛОГИКА ТОРГОВЛИ =================
+def update_position_info():
+    """Спрашиваем у Бинанса, есть ли у нас позиция (через API)"""
+    global in_position, position_data
+    try:
+        # Этот запрос делаем редко, только при необходимости
+        positions = exchange.fetch_positions([SYMBOL_CCXT])
+        pos = [p for p in positions if p['symbol'] == SYMBOL_CCXT][0]
+        amt = float(pos['contracts'])
+        
+        if amt != 0:
+            in_position = True
+            position_data = {
+                'side': pos['side'],      # 'long' или 'short'
+                'amount': amt,            # Сколько монет
+                'entry': float(pos['entryPrice']), # Цена входа
+                'pnl': float(pos['unrealizedPnl']) # Прибыль/убыток
+            }
+        else:
+            in_position = False
+            position_data = {}
+    except Exception as e:
+        print(f"Ошибка получения позиции: {e}")
+
+def execute_trade(action, reason):
+    """Исполнение ордеров"""
+    global last_trade_time
+    try:
+        # Защита от двойных нажатий (ждем 5 сек между сделками)
+        if time.time() - last_trade_time < 5: 
+            return
+
+        qty = QTY_USDT / current_price # Считаем объем в монетах
+        
+        if action == 'BUY_OPEN':
+            exchange.create_market_buy_order(SYMBOL_CCXT, qty)
+            log(f"🚀 OPEN LONG! Цена: {current_price} | {reason}")
+            
+        elif action == 'SELL_OPEN':
+            exchange.create_market_sell_order(SYMBOL_CCXT, qty)
+            log(f"🔻 OPEN SHORT! Цена: {current_price} | {reason}")
+            
+        elif action == 'CLOSE_LONG_AND_FLIP':
+            # Закрываем текущий лонг
+            amt = position_data.get('amount', 0)
+            if amt > 0: exchange.create_market_sell_order(SYMBOL_CCXT, amt)
+            # Открываем шорт
+            exchange.create_market_sell_order(SYMBOL_CCXT, qty)
+            log(f"🔄 ПЕРЕВОРОТ В SHORT! (Закрыли +{position_data.get('pnl',0)}$)")
+
+        elif action == 'CLOSE_SHORT_AND_FLIP':
+            # Закрываем текущий шорт
+            amt = position_data.get('amount', 0)
+            if amt > 0: exchange.create_market_buy_order(SYMBOL_CCXT, amt)
+            # Открываем лонг
+            exchange.create_market_buy_order(SYMBOL_CCXT, qty)
+            log(f"🔄 ПЕРЕВОРОТ В LONG! (Закрыли +{position_data.get('pnl',0)}$)")
+            
+        # Обновляем инфу о позиции после сделки
+        time.sleep(1) 
+        update_position_info()
+        last_trade_time = time.time()
+
+    except Exception as e:
+        log(f"⚠️ Ошибка ордера: {e}")
+
+def check_strategy():
+    """Главный мозг Змеи"""
+    if len(closes) < 30: return # Ждем пока наберется история
     
-    while True:
-        try:
-            klines = client.futures_klines(symbol=SYMBOL, interval='1m', limit=50)
-            closes = [float(k[4]) for k in klines[:-1]]
-            curr_p = float(klines[-1][4])
-
-            f_now = get_ema(closes, 7)
-            s_now = get_ema(closes, 25)
-            # diff положительный = резинка вверх (нужен шорт)
-            # diff отрицательный = резинка вниз (нужен лонг)
-            diff = (f_now - s_now) / s_now 
-
-            pos = client.futures_position_information(symbol=SYMBOL)
-            active_pos = next((p for p in pos if p['symbol'] == SYMBOL and float(p['positionAmt']) != 0), None)
-            amt = float(active_pos['positionAmt']) if active_pos else 0
-
-            # --- ЛОГИКА ---
-
-            # 1. ЕСЛИ МЫ БЕЗ ПОЗИЦИИ (Первый запуск)
-            if amt == 0:
-                current_steps = 0
-                if diff <= -THRESHOLD: # Резинка внизу (-0.005) -> ЛОНГ
-                    execute_entry('BUY', curr_p)
-                    last_entry_diff = diff # Запоминаем уровень (-0.005)
-                    current_steps = 1
-                elif diff >= THRESHOLD: # Резинка вверху (+0.005) -> ШОРТ
-                    execute_entry('SELL', curr_p)
-                    last_entry_diff = diff # Запоминаем уровень (+0.005)
-                    current_steps = 1
-
-            # 2. ЕСЛИ МЫ В ЛОНГЕ (amt > 0)
-            elif amt > 0:
-                # А) Усреднение (Цена падает ниже, diff становится более отрицательным)
-                # Пример: зашли на -0.005, стало -0.007 (-0.005 - 0.002)
-                if diff <= (last_entry_diff - STEP_DIFF) and current_steps < MAX_STEPS:
-                    execute_entry('BUY', curr_p)
-                    last_entry_diff = diff
-                    current_steps += 1
-                    send_tg(f"📉 Усреднение ЛОНГА №{current_steps}. Зазор: {diff*100:.2f}%")
-
-                # Б) ПЕРЕВОРОТ В ШОРТ (Цена улетела вверх, diff стал +0.005)
-                elif diff >= THRESHOLD:
-                    flip_position('SELL', curr_p, "Верхний пик")
-                    last_entry_diff = diff
-                    current_steps = 1
-
-            # 3. ЕСЛИ МЫ В ШОРТЕ (amt < 0)
-            elif amt < 0:
-                # А) Усреднение (Цена растет выше, diff становится более положительным)
-                # Пример: зашли на 0.005, стало 0.007 (0.005 + 0.002)
-                if diff >= (last_entry_diff + STEP_DIFF) and current_steps < MAX_STEPS:
-                    execute_entry('SELL', curr_p)
-                    last_entry_diff = diff
-                    current_steps += 1
-                    send_tg(f"📈 Усреднение ШОРТА №{current_steps}. Зазор: {diff*100:.2f}%")
-
-                # Б) ПЕРЕВОРОТ В ЛОНГ (Цена упала вниз, diff стал -0.005)
-                elif diff <= -THRESHOLD:
-                    flip_position('BUY', curr_p, "Нижний пик")
-                    last_entry_diff = diff
-                    current_steps = 1
-
-        except Exception as e:
-            print(f"Err: {e}")
+    # 1. Считаем EMA
+    series = pd.Series(closes)
+    ema7 = series.ewm(span=7, adjust=False).mean().iloc[-1]
+    ema25 = series.ewm(span=25, adjust=False).mean().iloc[-1]
+    
+    gap = (ema7 - ema25) / ema25
+    
+    # 2. Логика (только если цена изменилась)
+    if not in_position:
+        # Если позиции нет - ищем вход
+        if gap > THRESHOLD:
+            execute_trade('BUY_OPEN', f"Gap {gap:.4f} > 0.4%")
+        elif gap < -THRESHOLD:
+            execute_trade('SELL_OPEN', f"Gap {gap:.4f} < -0.4%")
+    
+    else:
+        # Если позиция есть - ищем выход или добор
+        side = position_data.get('side')
+        entry = position_data.get('entry')
         
-        time.sleep(30)
+        if side == 'long':
+            # Переворот
+            if gap < -THRESHOLD:
+                execute_trade('CLOSE_LONG_AND_FLIP', "Сигнал сменился")
+            # Усреднение (Добор)
+            elif (entry - current_price) / entry >= GRID_STEP:
+                 # Тут упрощенная логика добора, чтобы не спамить
+                 # В реале нужно считать кол-во ордеров
+                 pass 
 
-def execute_entry(side, price):
+        elif side == 'short':
+            # Переворот
+            if gap > THRESHOLD:
+                execute_trade('CLOSE_SHORT_AND_FLIP', "Сигнал сменился")
+            # Усреднение
+            elif (current_price - entry) / entry >= GRID_STEP:
+                pass
+
+# ================= 5. РАБОТА С СОКЕТОМ (WEB SOCKET) =================
+def on_message(ws, message):
+    global current_price, closes
+    json_msg = json.loads(message)
+    kline = json_msg['k']
+    
+    current_price = float(kline['c'])
+    is_closed = kline['x']
+    
+    # Если минута закрылась, записываем в историю
+    if is_closed:
+        closes.append(float(kline['c']))
+        if len(closes) > 50: closes.pop(0) # Храним только последние 50
+        
+        # Проверяем стратегию ПО ЗАКРЫТИЮ СВЕЧИ (самое надежное)
+        check_strategy()
+        
+    # Можно включить проверку на каждом тике, но для начала лучше по закрытию,
+    # чтобы не было ложных дерганий.
+
+def on_error(ws, error):
+    print(f"Socket Error: {error}")
+
+def on_close(ws, close_status_code, close_msg):
+    print("Соединение закрыто. Перезапуск...")
+    time.sleep(5)
+    start_socket() # Вечный реконнект
+
+def on_open(ws):
+    print("✅ Соединение с Binance установлено! Жду сигналов...")
+    # При старте один раз обновим позицию и историю
     try:
-        # Авто-кросс
-        try: client.futures_change_margin_type(symbol=SYMBOL, marginType='CROSSED')
-        except: pass
-        
-        client.futures_change_leverage(symbol=SYMBOL, leverage=LEVERAGE)
-        qty = round((MARGIN_STEP * LEVERAGE) / price, 2)
-        client.futures_create_order(symbol=SYMBOL, side=side, type='MARKET', quantity=qty)
-        send_tg(f"✅ *ВХОД {side}* (Добор). Цена: `{price}`")
-    except Exception as e:
-        send_tg(f"❌ Ошибка входа: {e}")
+        # Грузим 30 свечей истории через API (один раз!)
+        ohlcv = exchange.fetch_ohlcv(SYMBOL_CCXT, TIMEFRAME, limit=30)
+        global closes
+        closes = [x[4] for x in ohlcv]
+        update_position_info()
+        log(f"Бот запущен. Текущая цена: {closes[-1]}")
+    except:
+        pass
 
-def flip_position(new_side, price, reason):
-    try:
-        # 1. Закрываем старую позицию полностью
-        pos = client.futures_position_information(symbol=SYMBOL)
-        old_qty = abs(float(next(p for p in pos if p['symbol'] == SYMBOL)['positionAmt']))
-        
-        # Определяем сторону закрытия (если новый SELL, значит закрываем BUY)
-        close_side = 'SELL' if new_side == 'SELL' else 'BUY' 
-        
-        # Сначала закрываем старое
-        client.futures_create_order(symbol=SYMBOL, side=close_side, type='MARKET', quantity=old_qty, reduceOnly=True)
-        send_tg(f"💰 *ЗАКРЫТИЕ ПОЗИЦИИ* ({reason})")
-        time.sleep(1) # Секунда передышки, чтобы биржа обработала закрытие
-
-        # 2. Открываем новую позицию с нуля (первый шаг)
-        new_qty = round((MARGIN_STEP * LEVERAGE) / price, 2)
-        client.futures_create_order(symbol=SYMBOL, side=new_side, type='MARKET', quantity=new_qty)
-        send_tg(f"🚀 *ПЕРЕВОРОТ В {new_side}*. Цена: `{price}`")
-        
-    except Exception as e:
-        send_tg(f"❌ Ошибка переворота: {e}")
-
-if not os.environ.get("WERKZEUG_RUN_MAIN") == "true":
-    threading.Thread(target=run_swing_grid, daemon=True).start()
-
-@app.route('/')
-def health(): return "OK"
+def start_socket():
+    # URL для фьючерсов
+    socket = f"wss://fstream.binance.com/ws/{SYMBOL_SOCKET}@kline_{TIMEFRAME}"
+    ws = websocket.WebSocketApp(socket,
+                                on_open=on_open,
+                                on_message=on_message,
+                                on_error=on_error,
+                                on_close=on_close)
+    ws.run_forever()
 
 if __name__ == "__main__":
-    app.run(host='0.0.0.0', port=int(os.environ.get("PORT", 10000)))
+    # Установка плеча при старте
+    try:
+        exchange.load_markets()
+        market = exchange.market(SYMBOL_CCXT)
+        exchange.fapiPrivate_post_leverage({'symbol': market['id'], 'leverage': LEVERAGE})
+    except: pass
+    
+    start_socket()
