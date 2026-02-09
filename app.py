@@ -10,8 +10,8 @@ from datetime import datetime
 
 # ================= 1. БЕРЕМ КЛЮЧИ ИЗ RENDER =================
 # Бот сам найдет их в Environment Variables
-API_KEY = os.getenv('API_KEY')
-SECRET_KEY = os.getenv('SECRET_KEY')
+API_KEY = os.getenv('BINANCE_API_KEY')
+SECRET_KEY = os.getenv('BINANCE_API_SECRET')
 BOT_TOKEN = os.getenv('BOT_TOKEN')
 CHAT_ID = os.getenv('CHAT_ID')
 
