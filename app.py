@@ -102,7 +102,7 @@ def run_swing_grid():
         except Exception as e:
             print(f"Err: {e}")
         
-        time.sleep(15)
+        time.sleep(30)
 
 def execute_entry(side, price):
     try:
