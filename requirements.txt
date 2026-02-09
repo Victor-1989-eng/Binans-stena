@@ -1,6 +1,5 @@
-ccxt
-pyTelegramBotAPI
+flask
+python-binance
+requests
+unicorn-binance-websocket-api
 pandas
-numpy
-websocket-client
-
