@@ -1,4 +1,5 @@
-python-binance
-flask
-requests
-gunicorn
+ccxt
+pyTelegramBotAPI
+pandas
+numpy
+websocket-client
