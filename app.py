@@ -1,25 +1,25 @@
 import os, time, threading, requests, json
 from flask import Flask
 from binance.client import Client
-from unicorn_binance_websocket_api.manager import BinanceWebSocketApiManager # pip install unicorn-binance-websocket-api
+from unicorn_binance_websocket_api.manager import BinanceWebSocketApiManager
 
 app = Flask(__name__)
 
-# --- НАСТРОЙКИ (берутся из сред Render) ---
-SYMBOL = os.environ.get("SYMBOL", "SOLUSDC")
-THRESHOLD = 0.004       
+# --- НАСТРОЙКИ ---
+SYMBOL = "SOLUSDC"
+# СНИЗИЛИ ПОРОГ ДЛЯ ТЕСТА!
+THRESHOLD = 0.002       # 0.2% (Попробуем так, чтобы он начал заходить)
 STEP_DIFF = 0.002       
 MAX_STEPS = 6           
-LEVERAGE = 30            
-MARGIN_STEP = 1.0       
+LEVERAGE = 20           # Поставь 10-20 для безопасности!
+MARGIN_STEP = 1.0       # Размер первого входа в $
 
-# Инициализация клиента для ордеров
 client = Client(os.environ.get("BINANCE_API_KEY"), os.environ.get("BINANCE_API_SECRET"))
 
-# Память бота
+# Память
 current_steps = 0
 last_entry_diff = 0
-last_update_time = 0
+last_log_time = 0
 
 def send_tg(text):
     token, chat_id = os.environ.get("TELEGRAM_TOKEN"), os.environ.get("CHAT_ID")
@@ -29,119 +29,123 @@ def send_tg(text):
         except: pass
 
 def get_ema(values, span):
-    if len(values) < span: return 0
-    alpha = 2 / (span + 1)
-    ema = values[0]
-    for val in values[1:]: ema = (val * alpha) + (ema * (1 - alpha))
-    return ema
+    if len(values) < span: return values[-1] # Если мало данных, возвращаем последнюю цену
+    series = pd.Series(values)
+    return series.ewm(span=span, adjust=False).mean().iloc[-1]
+
+# Чтобы не тянуть pandas ради одной функции, простая математика:
+def calculate_ema(prices, days, smoothing=2):
+    ema = [sum(prices[:days]) / days]
+    for price in prices[days:]:
+        ema.append((price * (smoothing / (1 + days))) + (ema[-1] * (1 - (smoothing / (1 + days)))))
+    return ema[-1]
 
 def execute_entry(side, price):
     try:
-        client.futures_change_leverage(symbol=SYMBOL, leverage=LEVERAGE)
-        qty = round((MARGIN_STEP * LEVERAGE) / price, 2)
+        # client.futures_change_leverage(symbol=SYMBOL, leverage=LEVERAGE) # Раскомментируй если надо менять плечо каждый раз
+        qty = round((MARGIN_STEP * LEVERAGE) / price, 2) # Округлим до 2 знаков, для SOL пойдет
+        # Проверка минимального лота (для SOL это обычно 1 монета на споте, на фьючах меньше)
+        if qty < 0.1: qty = 0.1 
+        
         client.futures_create_order(symbol=SYMBOL, side=side, type='MARKET', quantity=qty)
-        send_tg(f"✅ *ВХОД {side}* (Добор). Цена: `{price}`")
+        send_tg(f"✅ *ВХОД {side}* | Цена: `{price}` | Объем: {qty}")
     except Exception as e:
-        send_tg(f"❌ Ошибка входа: {e}")
+        print(f"Ошибка ордера: {e}")
+        send_tg(f"❌ Не смог войти: {e}")
 
-def flip_position(new_side, price, reason):
-    try:
-        pos = client.futures_position_information(symbol=SYMBOL)
-        active_pos = next((p for p in pos if p['symbol'] == SYMBOL), None)
-        old_qty = abs(float(active_pos['positionAmt'])) if active_pos else 0
-        
-        if old_qty > 0:
-            close_side = 'SELL' if new_side == 'SELL' else 'BUY'
-            client.futures_create_order(symbol=SYMBOL, side=close_side, type='MARKET', quantity=old_qty, reduceOnly=True)
-            send_tg(f"💰 *ЗАКРЫТИЕ ПОЗИЦИИ* ({reason})")
-            time.sleep(1)
-
-        new_qty = round((MARGIN_STEP * LEVERAGE) / price, 2)
-        client.futures_create_order(symbol=SYMBOL, side=new_side, type='MARKET', quantity=new_qty)
-        send_tg(f"🚀 *ПЕРЕВОРОТ В {new_side}*. Цена: `{price}`")
-    except Exception as e:
-        send_tg(f"❌ Ошибка переворота: {e}")
-
-def process_logic(curr_p):
-    global current_steps, last_entry_diff, last_update_time
+def process_logic(curr_p, closes):
+    global current_steps, last_entry_diff, last_log_time
     
-    # Чтобы не перегружать проц, считаем логику не чаще чем раз в 5 секунд
-    if time.time() - last_update_time < 5:
-        return
-    last_update_time = time.time()
+    # 1. Считаем индикаторы
+    if len(closes) < 26: return # Ждем накопления истории
+    
+    # Ручной расчет EMA без pandas (быстрее и легче)
+    f_now = calculate_ema(closes, 7)
+    s_now = calculate_ema(closes, 25)
+    
+    diff = (f_now - s_now) / s_now 
+    
+    # --- ЛОГГЕР "ПУЛЬС" (Каждую минуту пишет в лог Render) ---
+    if time.time() - last_log_time > 60:
+        print(f"💓 ПУЛЬС: Цена {curr_p} | EMA7: {f_now:.2f} | EMA25: {s_now:.2f} | GAP: {diff:.5f} (Порог {THRESHOLD})")
+        # Если GAP очень близко, но не дотягивает - напишем в ТГ
+        if abs(diff) > (THRESHOLD * 0.8):
+           pass # Можно включить send_tg(f"👀 Присматриваюсь... Gap: {diff:.5f}")
+        last_log_time = time.time()
 
+    # Получаем позицию (этот запрос может замедлять, лучше хранить локально, но для надежности оставим)
     try:
-        # Получаем историю для EMA (через API, но редко)
-        klines = client.futures_klines(symbol=SYMBOL, interval='1m', limit=50)
-        closes = [float(k[4]) for k in klines[:-1]]
-        
-        f_now = get_ema(closes, 7)
-        s_now = get_ema(closes, 25)
-        diff = (f_now - s_now) / s_now 
+        # ВНИМАНИЕ: Часто долбить API нельзя. 
+        # Логику входа проверяем по GAP, а позицию проверяем только если GAP сработал?
+        # Нет, нам надо знать направление. 
+        # Упростим: считаем что мы знаем позицию, если бот не перезапускался.
+        # Но для надежности - запрос.
+        pass 
+    except: pass
 
-        pos = client.futures_position_information(symbol=SYMBOL)
-        active_pos = next((p for p in pos if p['symbol'] == SYMBOL and float(p['positionAmt']) != 0), None)
-        amt = float(active_pos['positionAmt']) if active_pos else 0
-
-        # --- ТВОЯ ЛОГИКА КАЧЕЛЕЙ ---
-        if amt == 0:
-            current_steps = 0
-            if diff <= -THRESHOLD: 
+    # --- УПРОЩЕННАЯ ЛОГИКА ДЛЯ ТЕСТА ---
+    # Давай проверим просто вход, работает ли он вообще
+    if abs(diff) >= THRESHOLD:
+        try:
+            pos = client.futures_position_information(symbol=SYMBOL)
+            active_pos = next((p for p in pos if p['symbol'] == SYMBOL), None)
+            amt = float(active_pos['positionAmt']) if active_pos else 0
+            
+            # ВХОД LONG
+            if amt == 0 and diff <= -THRESHOLD:
                 execute_entry('BUY', curr_p)
-                last_entry_diff, current_steps = diff, 1
-            elif diff >= THRESHOLD:
+                current_steps = 1
+                last_entry_diff = diff
+                
+            # ВХОД SHORT
+            elif amt == 0 and diff >= THRESHOLD:
                 execute_entry('SELL', curr_p)
-                last_entry_diff, current_steps = diff, 1
+                current_steps = 1
+                last_entry_diff = diff
+                
+            # (Тут можно добавить логику доборов, но давай сначала добьемся первого входа!)
+            
+        except Exception as e:
+            print(f"Ошибка API: {e}")
 
-        elif amt > 0: # LONG
-            if diff <= (last_entry_diff - STEP_DIFF) and current_steps < MAX_STEPS:
-                execute_entry('BUY', curr_p)
-                last_entry_diff, current_steps = diff, current_steps + 1
-                send_tg(f"📉 Усреднение ЛОНГА №{current_steps}")
-            elif diff >= THRESHOLD:
-                flip_position('SELL', curr_p, "Верхний пик")
-                last_entry_diff, current_steps = diff, 1
-
-        elif amt < 0: # SHORT
-            if diff >= (last_entry_diff + STEP_DIFF) and current_steps < MAX_STEPS:
-                execute_entry('SELL', curr_p)
-                last_entry_diff, current_steps = diff, current_steps + 1
-                send_tg(f"📈 Усреднение ШОРТА №{current_steps}")
-            elif diff <= -THRESHOLD:
-                flip_position('BUY', curr_p, "Нижний пик")
-                last_entry_diff, current_steps = diff, 1
-
-    except Exception as e:
-        print(f"Ошибка логики: {e}")
-
-# --- SOCKET МЕНЕДЖЕР ---
+# --- SOCKET ---
 def run_websocket():
-    # Создаем менеджер сокетов
     ubwa = BinanceWebSocketApiManager(exchange="binance.com-futures")
     ubwa.create_stream(['kline_1m'], [SYMBOL.lower()])
+    print(f"🔌 Сокет запущен. Жду свечей...")
     
-    log_msg = f"🔌 Сокет запущен для {SYMBOL}. Слушаю эфир..."
-    print(log_msg)
-    send_tg(log_msg)
+    # Накапливаем историю вручную, чтобы не зависеть от тяжелых запросов
+    closes_history = [] 
 
     while True:
         if ubwa.is_update_available():
             oldest_data = ubwa.pop_stream_data_from_stream_buffer()
             if oldest_data:
                 data = json.loads(oldest_data)
-                if 'data' in data and 'k' in data['data']:
-                    curr_p = float(data['data']['k']['c'])
-                    process_logic(curr_p)
+                try:
+                    if 'data' in data and 'k' in data['data']:
+                        kline = data['data']['k']
+                        is_closed = kline['x'] # Свеча закрылась?
+                        close_p = float(kline['c'])
+                        
+                        # Добавляем в историю ТОЛЬКО закрытые свечи для точного EMA
+                        if is_closed:
+                            closes_history.append(close_p)
+                            if len(closes_history) > 50: closes_history.pop(0)
+                            
+                            # Запускаем логику
+                            process_logic(close_p, closes_history)
+                            print(f"Свеча закрыта: {close_p}")
+                        
+                except Exception as e:
+                    print(f"Ошибка парсинга: {e}")
         else:
-            time.sleep(0.1)
+            time.sleep(0.01)
 
-# Запуск сокета в отдельном потоке
 threading.Thread(target=run_websocket, daemon=True).start()
 
 @app.route('/')
-def health(): return "Snake Bot is Online (WebSocket Mode)"
+def health(): return "Snake Bot Debug Mode"
 
 if __name__ == "__main__":
-    # На бесплатном Render важен PORT
-    port = int(os.environ.get("PORT", 10000))
-    app.run(host='0.0.0.0', port=port)
+    app.run(host='0.0.0.0', port=int(os.environ.get("PORT", 10000)))
