@@ -1,151 +1,120 @@
-import os, time, threading, requests, json
+import os, json, time, threading, requests
 from flask import Flask
 from binance.client import Client
-from unicorn_binance_websocket_api.manager import BinanceWebSocketApiManager
+import websocket # pip install websocket-client
 
 app = Flask(__name__)
 
 # --- НАСТРОЙКИ ---
-SYMBOL = "SOLUSDC"
-# СНИЗИЛИ ПОРОГ ДЛЯ ТЕСТА!
-THRESHOLD = 0.002       # 0.2% (Попробуем так, чтобы он начал заходить)
-STEP_DIFF = 0.002       
-MAX_STEPS = 6           
-LEVERAGE = 20           # Поставь 10-20 для безопасности!
-MARGIN_STEP = 1.0       # Размер первого входа в $
+SYMBOL_UPPER = "SOLUSDC"
+SYMBOL_LOWER = "solusdc" 
+THRESHOLD = 0.002       # 0.2%
+LEVERAGE = 20           
+MARGIN_STEP = 1.0       
 
-client = Client(os.environ.get("BINANCE_API_KEY"), os.environ.get("BINANCE_API_SECRET"))
+# Клиент для ордеров
+try:
+    client = Client(os.environ.get("BINANCE_API_KEY"), os.environ.get("BINANCE_API_SECRET"))
+except:
+    print("⚠️ API ключи не найдены или неверны")
 
 # Память
-current_steps = 0
-last_entry_diff = 0
+closes = []
 last_log_time = 0
 
 def send_tg(text):
-    token, chat_id = os.environ.get("TELEGRAM_TOKEN"), os.environ.get("CHAT_ID")
+    token = os.environ.get("TELEGRAM_TOKEN")
+    chat_id = os.environ.get("CHAT_ID")
     if token and chat_id:
         try: requests.post(f"https://api.telegram.org/bot{token}/sendMessage", 
-                           json={"chat_id": chat_id, "text": f"[{SYMBOL}] {text}", "parse_mode": "Markdown"})
+                           json={"chat_id": chat_id, "text": f"[{SYMBOL_UPPER}] {text}", "parse_mode": "Markdown"})
         except: pass
 
-def get_ema(values, span):
-    if len(values) < span: return values[-1] # Если мало данных, возвращаем последнюю цену
-    series = pd.Series(values)
-    return series.ewm(span=span, adjust=False).mean().iloc[-1]
+# --- ПРОСТАЯ МАТЕМАТИКА EMA ---
+def calculate_ema(prices, days):
+    if len(prices) < days: return prices[-1]
+    ema = prices[0]
+    multiplier = 2 / (days + 1)
+    for price in prices[1:]:
+        ema = (price - ema) * multiplier + ema
+    return ema
 
-# Чтобы не тянуть pandas ради одной функции, простая математика:
-def calculate_ema(prices, days, smoothing=2):
-    ema = [sum(prices[:days]) / days]
-    for price in prices[days:]:
-        ema.append((price * (smoothing / (1 + days))) + (ema[-1] * (1 - (smoothing / (1 + days)))))
-    return ema[-1]
-
-def execute_entry(side, price):
-    try:
-        # client.futures_change_leverage(symbol=SYMBOL, leverage=LEVERAGE) # Раскомментируй если надо менять плечо каждый раз
-        qty = round((MARGIN_STEP * LEVERAGE) / price, 2) # Округлим до 2 знаков, для SOL пойдет
-        # Проверка минимального лота (для SOL это обычно 1 монета на споте, на фьючах меньше)
-        if qty < 0.1: qty = 0.1 
-        
-        client.futures_create_order(symbol=SYMBOL, side=side, type='MARKET', quantity=qty)
-        send_tg(f"✅ *ВХОД {side}* | Цена: `{price}` | Объем: {qty}")
-    except Exception as e:
-        print(f"Ошибка ордера: {e}")
-        send_tg(f"❌ Не смог войти: {e}")
-
-def process_logic(curr_p, closes):
-    global current_steps, last_entry_diff, last_log_time
+# --- ЛОГИКА ---
+def process_candle(close_price):
+    global closes, last_log_time
     
-    # 1. Считаем индикаторы
-    if len(closes) < 26: return # Ждем накопления истории
-    
-    # Ручной расчет EMA без pandas (быстрее и легче)
+    closes.append(close_price)
+    if len(closes) > 50: closes.pop(0)
+
+    # Пока копим историю - просто пишем пульс
+    if len(closes) < 10:
+        print(f"📥 Накапливаю историю: {len(closes)}/26 свечей...", flush=True)
+        return
+
+    # Считаем
     f_now = calculate_ema(closes, 7)
     s_now = calculate_ema(closes, 25)
-    
     diff = (f_now - s_now) / s_now 
-    
-    # --- ЛОГГЕР "ПУЛЬС" (Каждую минуту пишет в лог Render) ---
+
+    # Лог раз в минуту или при сильном сигнале
     if time.time() - last_log_time > 60:
-        print(f"💓 ПУЛЬС: Цена {curr_p} | EMA7: {f_now:.2f} | EMA25: {s_now:.2f} | GAP: {diff:.5f} (Порог {THRESHOLD})")
-        # Если GAP очень близко, но не дотягивает - напишем в ТГ
-        if abs(diff) > (THRESHOLD * 0.8):
-           pass # Можно включить send_tg(f"👀 Присматриваюсь... Gap: {diff:.5f}")
+        msg = f"💓 ПУЛЬС: Цена {close_price} | Gap: {diff:.5f} (Порог {THRESHOLD})"
+        print(msg, flush=True) # flush=True заставляет Render писать лог сразу!
         last_log_time = time.time()
 
-    # Получаем позицию (этот запрос может замедлять, лучше хранить локально, но для надежности оставим)
-    try:
-        # ВНИМАНИЕ: Часто долбить API нельзя. 
-        # Логику входа проверяем по GAP, а позицию проверяем только если GAP сработал?
-        # Нет, нам надо знать направление. 
-        # Упростим: считаем что мы знаем позицию, если бот не перезапускался.
-        # Но для надежности - запрос.
-        pass 
-    except: pass
-
-    # --- УПРОЩЕННАЯ ЛОГИКА ДЛЯ ТЕСТА ---
-    # Давай проверим просто вход, работает ли он вообще
+    # ТУТ ТВОЯ ЛОГИКА ВХОДОВ (упрощенно для теста)
     if abs(diff) >= THRESHOLD:
-        try:
-            pos = client.futures_position_information(symbol=SYMBOL)
-            active_pos = next((p for p in pos if p['symbol'] == SYMBOL), None)
-            amt = float(active_pos['positionAmt']) if active_pos else 0
+        print(f"🔥 СИГНАЛ! Gap: {diff:.5f}", flush=True)
+        # execute_entry(...) - раскомментируешь, когда увидишь логи
+
+# --- ПРЯМОЙ СОКЕТ (Самый надежный метод) ---
+def on_message(ws, message):
+    try:
+        json_msg = json.loads(message)
+        kline = json_msg['k']
+        is_closed = kline['x'] # Свеча закрылась?
+        current_price = float(kline['c'])
+        
+        # ЧТОБЫ ТЫ УВИДЕЛ, ЧТО ОН ЖИВОЙ:
+        # Пишем в лог каждые 10 секунд даже если свеча не закрыта
+        if int(time.time()) % 10 == 0:
+             print(f"👀 Тик цены: {current_price}", flush=True)
+
+        if is_closed:
+            print(f"🕯 Свеча ЗАКРЫТА: {current_price}", flush=True)
+            process_candle(current_price)
             
-            # ВХОД LONG
-            if amt == 0 and diff <= -THRESHOLD:
-                execute_entry('BUY', curr_p)
-                current_steps = 1
-                last_entry_diff = diff
-                
-            # ВХОД SHORT
-            elif amt == 0 and diff >= THRESHOLD:
-                execute_entry('SELL', curr_p)
-                current_steps = 1
-                last_entry_diff = diff
-                
-            # (Тут можно добавить логику доборов, но давай сначала добьемся первого входа!)
-            
-        except Exception as e:
-            print(f"Ошибка API: {e}")
+    except Exception as e:
+        print(f"Ошибка чтения: {e}", flush=True)
 
-# --- SOCKET ---
-def run_websocket():
-    ubwa = BinanceWebSocketApiManager(exchange="binance.com-futures")
-    ubwa.create_stream(['kline_1m'], [SYMBOL.lower()])
-    print(f"🔌 Сокет запущен. Жду свечей...")
-    
-    # Накапливаем историю вручную, чтобы не зависеть от тяжелых запросов
-    closes_history = [] 
+def on_error(ws, error):
+    print(f"❌ Ошибка сокета: {error}", flush=True)
 
-    while True:
-        if ubwa.is_update_available():
-            oldest_data = ubwa.pop_stream_data_from_stream_buffer()
-            if oldest_data:
-                data = json.loads(oldest_data)
-                try:
-                    if 'data' in data and 'k' in data['data']:
-                        kline = data['data']['k']
-                        is_closed = kline['x'] # Свеча закрылась?
-                        close_p = float(kline['c'])
-                        
-                        # Добавляем в историю ТОЛЬКО закрытые свечи для точного EMA
-                        if is_closed:
-                            closes_history.append(close_p)
-                            if len(closes_history) > 50: closes_history.pop(0)
-                            
-                            # Запускаем логику
-                            process_logic(close_p, closes_history)
-                            print(f"Свеча закрыта: {close_p}")
-                        
-                except Exception as e:
-                    print(f"Ошибка парсинга: {e}")
-        else:
-            time.sleep(0.01)
+def on_close(ws, close_status_code, close_msg):
+    print("⚠️ Сокет закрыт. Перезапускаю через 5 сек...", flush=True)
+    time.sleep(5)
+    start_socket()
 
-threading.Thread(target=run_websocket, daemon=True).start()
+def on_open(ws):
+    print("✅ Соединение с Binance установлено! Полетели данные...", flush=True)
+    send_tg("Бот перезагружен и подключен к потоку!")
 
+def start_socket():
+    # Прямая ссылка на стрим фьючерсов
+    socket_url = f"wss://fstream.binance.com/ws/{SYMBOL_LOWER}@kline_1m"
+    ws = websocket.WebSocketApp(socket_url,
+                                on_open=on_open,
+                                on_message=on_message,
+                                on_error=on_error,
+                                on_close=on_close)
+    ws.run_forever()
+
+# Запускаем в фоне
+threading.Thread(target=start_socket, daemon=True).start()
+
+# --- FLASK ---
 @app.route('/')
-def health(): return "Snake Bot Debug Mode"
+def index(): return "Snake Bot is Alive"
 
 if __name__ == "__main__":
     app.run(host='0.0.0.0', port=int(os.environ.get("PORT", 10000)))
