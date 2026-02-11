@@ -6,8 +6,8 @@ import websocket
 app = Flask(__name__)
 
 # ================= НАСТРОЙКИ (ТВОИ ЛЮБИМЫЕ) =================
-SYMBOL_UPPER = "SOLUSDC"
-SYMBOL_LOWER = "solusdc" 
+SYMBOL_UPPER = "SOLUSDT"
+SYMBOL_LOWER = "solusdt" 
 
 ENTRY_THRESHOLD = 0.005    # 0.3% разрыва для входа
 STEP_DIFF = 0.002          # 0.2% разрыва для усреднения
