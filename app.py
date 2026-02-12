@@ -1,4 +1,4 @@
-import os, json, time, threading, requests
+9import os, json, time, threading, requests
 from flask import Flask
 from binance.client import Client
 import websocket 
@@ -9,13 +9,13 @@ app = Flask(__name__)
 SYMBOL_UPPER = "SOLUSDT"
 SYMBOL_LOWER = "solusdt" 
 
-ENTRY_THRESHOLD = 0.009    # 0.3% разрыва для входа
-STEP_DIFF = 0.003          # 0.2% разрыва для усреднения
+ENTRY_THRESHOLD = 0.006    # 0.3% разрыва для входа
+STEP_DIFF = 0.006          # 0.2% разрыва для усреднения
 MAX_STEPS = 9              # Лимит усреднений
-EXIT_THRESHOLD = 0.002     # 0.1% после пересечения для выхода
+EXIT_THRESHOLD = 0.0005     # 0.1% после пересечения для выхода
 
 LEVERAGE = 30              
-MARGIN_STEP = 4.0          
+MARGIN_STEP = 3.3          
 # ============================================================
 
 client = Client(os.environ.get("BINANCE_API_KEY"), os.environ.get("BINANCE_API_SECRET"))
