@@ -9,7 +9,7 @@ app = Flask(__name__)
 SYMBOL_UPPER = "SOLUSDT"
 SYMBOL_LOWER = "solusdt" 
 
-ENTRY_THRESHOLD = 0.005    # 0.3% разрыва для входа
+ENTRY_THRESHOLD = 0.009    # 0.3% разрыва для входа
 STEP_DIFF = 0.003          # 0.2% разрыва для усреднения
 MAX_STEPS = 9              # Лимит усреднений
 EXIT_THRESHOLD = 0.002     # 0.1% после пересечения для выхода
