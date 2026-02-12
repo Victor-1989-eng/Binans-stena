@@ -5,17 +5,17 @@ import websocket
 
 app = Flask(__name__)
 
-# ================= НАСТРОЙКИ (ТВОИ ЛЮБИМЫЕ) =================
+# ================= НАСТРОЙКИ (ТВОИ НОВЫЕ БЕЗОПАСНЫЕ) =================
 SYMBOL_UPPER = "SOLUSDT"
 SYMBOL_LOWER = "solusdt" 
 
-ENTRY_THRESHOLD = 0.002    # 0.3% разрыва для входа
-STEP_DIFF = 0.001          # 0.2% разрыва для усреднения
-MAX_STEPS = 9              # Лимит усреднений
-EXIT_THRESHOLD = 0.001     # 0.1% после пересечения для выхода
+ENTRY_THRESHOLD = 0.002    # Твой вход на 0.002
+STEP_DIFF = 0.001          # Усреднение через каждые 0.001
+MAX_STEPS = 9              
+EXIT_THRESHOLD = 0.001     # Выход: пролет на 0.001 за среднюю
 
-LEVERAGE = 10              
-MARGIN_STEP = 1.0          
+LEVERAGE = 10              # Безопасное плечо x10
+MARGIN_STEP = 1.0          # Маржа 1$ (итого 10$ в рынке на шаг)
 # ============================================================
 
 client = Client(os.environ.get("BINANCE_API_KEY"), os.environ.get("BINANCE_API_SECRET"))
@@ -24,6 +24,13 @@ last_log_time = 0
 current_steps = 0      
 last_entry_gap = 0     
 
+# --- ПЕРЕМЕННЫЕ ДЛЯ СТАТИСТИКИ ---
+stats = {
+    "entry_gaps": [],
+    "exit_overshoots": [],
+    "total_trades": 0
+}
+
 def send_tg(text):
     token, chat_id = os.environ.get("TELEGRAM_TOKEN"), os.environ.get("CHAT_ID")
     if token and chat_id:
@@ -31,7 +38,6 @@ def send_tg(text):
                            json={"chat_id": chat_id, "text": text, "parse_mode": "Markdown"})
         except: pass
 
-# --- ФУНКЦИИ КРАСИВЫХ СООБЩЕНИЙ ---
 def tg_report_entry(side, step, price, gap):
     icon = "🟢" if side == "BUY" else "🔴"
     title = "ВХОД В ПОЗИЦИЮ" if step == 1 else "УСРЕДНЕНИЕ (ДОБОР)"
@@ -48,17 +54,23 @@ def tg_report_entry(side, step, price, gap):
     send_tg(msg)
 
 def tg_report_close(side, steps, gap):
+    # Считаем средние показатели
+    avg_entry = sum(stats["entry_gaps"]) / len(stats["entry_gaps"]) if stats["entry_gaps"] else 0
+    avg_exit = sum(stats["exit_overshoots"]) / len(stats["exit_overshoots"]) if stats["exit_overshoots"] else 0
+    
     msg = (
         f"💰 *ФИКСАЦИЯ ПРИБЫЛИ* 💰\n"
         f"━━━━━━━━━━━━━━━\n"
         f"✅ *Позиция {side} закрыта*\n"
         f"📈 *Шагов сетки:* `{steps}`\n"
         f"🏁 *Gap на выходе:* `{gap:.5f}`\n"
+        f"📊 *Средний вход (сутки):* `-{abs(avg_entry):.4f}`\n"
+        f"🎯 *Средний пролет (сутки):* `+{abs(avg_exit):.4f}`\n"
+        f"🔢 *Всего сделок:* `{stats['total_trades']}`\n"
         f"✨ *Профит в копилке!*"
     )
     send_tg(msg)
 
-# Проверенная формула EMA из твоего идеального кода
 def get_ema(values, span):
     if len(values) < span: return values[-1]
     alpha = 2 / (span + 1)
@@ -68,7 +80,6 @@ def get_ema(values, span):
 
 def execute_order(side, step_num, gap):
     try:
-        # Настройка аккаунта перед сделкой (как в старом коде)
         try: client.futures_change_margin_type(symbol=SYMBOL_UPPER, marginType='CROSSED')
         except: pass
         client.futures_change_leverage(symbol=SYMBOL_UPPER, leverage=LEVERAGE)
@@ -78,6 +89,11 @@ def execute_order(side, step_num, gap):
         if qty < 0.1: qty = 0.1
         
         client.futures_create_order(symbol=SYMBOL_UPPER, side=side, type='MARKET', quantity=qty)
+        
+        # Записываем стат только для первого входа
+        if step_num == 1:
+            stats["entry_gaps"].append(gap)
+            
         tg_report_entry(side, step_num, price, gap)
         return True
     except Exception as e:
@@ -88,10 +104,10 @@ def process_candle(close_price):
     global closes, last_log_time, current_steps, last_entry_gap
     
     closes.append(close_price)
-    if len(closes) > 60: closes.pop(0)
+    if len(closes) > 100: closes.pop(0) # Увеличил до 100, чтобы EMA 99 работала, если захочешь
     if len(closes) < 26: return
 
-    # Расчет Gap на основе EMA
+    # Твои любимые 7 и 25
     f_now = get_ema(closes, 7)
     s_now = get_ema(closes, 25)
     gap = (f_now - s_now) / s_now 
@@ -101,13 +117,10 @@ def process_candle(close_price):
         last_log_time = time.time()
 
     try:
-        # Получаем позицию с защитой от ошибок
         pos_info = client.futures_position_information(symbol=SYMBOL_UPPER)
-        if not isinstance(pos_info, list): return
         my_pos = next((p for p in pos_info if p['symbol'] == SYMBOL_UPPER), None)
         amt = float(my_pos['positionAmt']) if my_pos else 0
         
-        # --- ЛОГИКА ТОРГОВЛИ ---
         if amt == 0:
             current_steps = 0
             if gap <= -ENTRY_THRESHOLD:
@@ -117,23 +130,27 @@ def process_candle(close_price):
                 if execute_order('SELL', 1, gap):
                     current_steps, last_entry_gap = 1, gap
 
-        elif amt > 0: # LONG сопровождение
+        elif amt > 0: # LONG
             if gap <= (last_entry_gap - STEP_DIFF) and current_steps < MAX_STEPS:
                 if execute_order('BUY', current_steps + 1, gap):
                     current_steps += 1
                     last_entry_gap = gap
             elif gap >= EXIT_THRESHOLD:
                 client.futures_create_order(symbol=SYMBOL_UPPER, side='SELL', type='MARKET', quantity=amt, reduceOnly=True)
+                stats["exit_overshoots"].append(gap)
+                stats["total_trades"] += 1
                 tg_report_close("LONG", current_steps, gap)
                 current_steps = 0
 
-        elif amt < 0: # SHORT сопровождение
+        elif amt < 0: # SHORT
             if gap >= (last_entry_gap + STEP_DIFF) and current_steps < MAX_STEPS:
                 if execute_order('SELL', current_steps + 1, gap):
                     current_steps += 1
                     last_entry_gap = gap
             elif gap <= -EXIT_THRESHOLD:
                 client.futures_create_order(symbol=SYMBOL_UPPER, side='BUY', type='MARKET', quantity=abs(amt), reduceOnly=True)
+                stats["exit_overshoots"].append(gap)
+                stats["total_trades"] += 1
                 tg_report_close("SHORT", current_steps, gap)
                 current_steps = 0
 
@@ -144,10 +161,8 @@ def start_socket():
     url = f"wss://fstream.binance.com/ws/{SYMBOL_LOWER}@kline_1m"
     def on_msg(ws, msg):
         js = json.loads(msg)
-        if js['k']['x']: # Срабатывает только на закрытии минутки
+        if js['k']['x']: 
             process_candle(float(js['k']['c']))
-        elif int(time.time()) % 20 == 0: 
-            print(f"👀 {js['k']['c']}", flush=True)
     
     ws = websocket.WebSocketApp(url, on_message=on_msg, on_error=lambda w,e: print(f"Socket Err: {e}"), 
                                 on_close=lambda w,a,b: [time.sleep(5), start_socket()])
@@ -157,8 +172,7 @@ threading.Thread(target=start_socket, daemon=True).start()
 
 @app.route('/')
 def idx(): 
-    status = "OK" if len(closes) >= 26 else "WAITING_HISTORY"
-    return f"Snake Bot 5.3 Stable. Status: {status} ({len(closes)}/60)"
+    return f"Snake Bot 5.4 Stats Edition. Total Trades: {stats['total_trades']}"
 
 if __name__ == "__main__":
     app.run(host='0.0.0.0', port=int(os.environ.get("PORT", 10000)))
