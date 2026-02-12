@@ -11,7 +11,7 @@ SYMBOL_LOWER = "solusdt"
 
 ENTRY_THRESHOLD = 0.002    # 0.3% разрыва для входа
 STEP_DIFF = 0.001          # 0.2% разрыва для усреднения
-MAX_STEPS = 3              # Лимит усреднений
+MAX_STEPS = 9              # Лимит усреднений
 EXIT_THRESHOLD = 0.001     # 0.1% после пересечения для выхода
 
 LEVERAGE = 10              
