@@ -9,13 +9,13 @@ app = Flask(__name__)
 SYMBOL_UPPER = "SOLUSDT"
 SYMBOL_LOWER = "solusdt" 
 
-ENTRY_THRESHOLD = 0.005    # Твой вход на 0.002
-STEP_DIFF = 0.005          # Усреднение через каждые 0.001
+ENTRY_THRESHOLD = 0.008    # Твой вход на 0.002
+STEP_DIFF = 0.004          # Усреднение через каждые 0.001
 MAX_STEPS = 2              
 EXIT_THRESHOLD = 0.0005     # Выход: пролет на 0.001 за среднюю
 
 LEVERAGE = 30              # Безопасное плечо x10
-MARGIN_STEP = 3.0          # Маржа 1$ (итого 10$ в рынке на шаг)
+MARGIN_STEP = 10.0          # Маржа 1$ (итого 10$ в рынке на шаг)
 # ============================================================
 
 client = Client(os.environ.get("BINANCE_API_KEY"), os.environ.get("BINANCE_API_SECRET"))
