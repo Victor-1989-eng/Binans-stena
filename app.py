@@ -9,10 +9,10 @@ app = Flask(__name__)
 SYMBOL_UPPER = "SOLUSDT"
 SYMBOL_LOWER = "solusdt" 
 
-ENTRY_THRESHOLD = 0.002    # Твой вход на 0.002
+ENTRY_THRESHOLD = 0.003    # Твой вход на 0.002
 STEP_DIFF = 0.005          # Усреднение через каждые 0.001
 MAX_STEPS = 2              
-EXIT_THRESHOLD = 0.001     # Выход: пролет на 0.001 за среднюю
+EXIT_THRESHOLD = 0.0005     # Выход: пролет на 0.001 за среднюю
 
 LEVERAGE = 30              # Безопасное плечо x10
 MARGIN_STEP = 3.0          # Маржа 1$ (итого 10$ в рынке на шаг)
