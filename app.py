@@ -10,12 +10,12 @@ SYMBOL_UPPER = "SOLUSDT"
 SYMBOL_LOWER = "solusdt" 
 
 ENTRY_THRESHOLD = 0.002    # Твой вход на 0.002
-STEP_DIFF = 0.001          # Усреднение через каждые 0.001
-MAX_STEPS = 9              
+STEP_DIFF = 0.005          # Усреднение через каждые 0.001
+MAX_STEPS = 2              
 EXIT_THRESHOLD = 0.001     # Выход: пролет на 0.001 за среднюю
 
-LEVERAGE = 10              # Безопасное плечо x10
-MARGIN_STEP = 1.0          # Маржа 1$ (итого 10$ в рынке на шаг)
+LEVERAGE = 30              # Безопасное плечо x10
+MARGIN_STEP = 3.0          # Маржа 1$ (итого 10$ в рынке на шаг)
 # ============================================================
 
 client = Client(os.environ.get("BINANCE_API_KEY"), os.environ.get("BINANCE_API_SECRET"))
