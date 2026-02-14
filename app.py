@@ -1,178 +1,161 @@
 import os, json, time, threading, requests
 from flask import Flask
 from binance.client import Client
-import websocket 
+import websocket
 
 app = Flask(__name__)
 
-# ================= НАСТРОЙКИ (ТВОИ НОВЫЕ БЕЗОПАСНЫЕ) =================
+# ================= НАСТРОЙКИ (ПОД ТВОЮ СХЕМУ) =================
+IS_PAPER_MODE = True       # True - тесты, False - реальные деньги!
 SYMBOL_UPPER = "SOLUSDT"
-SYMBOL_LOWER = "solusdt" 
+SYMBOL_LOWER = "solusdt"   # Для WebSocket
 
-ENTRY_THRESHOLD = 0.008    # Твой вход на 0.002
-STEP_DIFF = 0.004          # Усреднение через каждые 0.001
-MAX_STEPS = 2              
-EXIT_THRESHOLD = 0.0005     # Выход: пролет на 0.001 за среднюю
+# Параметры индикаторов
+EMA_FAST = 25
+EMA_SLOW = 99
+TREND_CONFIRM = 0.0005     # Зазор 0.05% для входа/перезахода
+REVERSE_GAP = 0.009        # "Резинка" 0.9% для переворота
 
-LEVERAGE = 30              # Безопасное плечо x10
-MARGIN_STEP = 10.0          # Маржа 1$ (итого 10$ в рынке на шаг)
-# ============================================================
+# Параметры депозита
+LEVERAGE = 30
+MARGIN_STEP = 10.0         # Маржа на один шаг (из твоих $1000)
+VIRTUAL_BALANCE = 100.0   # Тестовый баланс
+# ==============================================================
 
 client = Client(os.environ.get("BINANCE_API_KEY"), os.environ.get("BINANCE_API_SECRET"))
 closes = []
-last_log_time = 0
-current_steps = 0      
-last_entry_gap = 0     
-
-# --- ПЕРЕМЕННЫЕ ДЛЯ СТАТИСТИКИ ---
-stats = {
-    "entry_gaps": [],
-    "exit_overshoots": [],
-    "total_trades": 0
-}
+paper_vars = {"pos_amt": 0, "entry_price": 0, "side": None, "balance": VIRTUAL_BALANCE}
+max_stats = {"max_long_gap": 0, "max_short_gap": 0}
 
 def send_tg(text):
-    token, chat_id = os.environ.get("TELEGRAM_TOKEN"), os.environ.get("CHAT_ID")
+    token = os.environ.get("TELEGRAM_TOKEN")
+    chat_id = os.environ.get("CHAT_ID")
     if token and chat_id:
-        try: requests.post(f"https://api.telegram.org/bot{token}/sendMessage", 
-                           json={"chat_id": chat_id, "text": text, "parse_mode": "Markdown"})
-        except: pass
-
-def tg_report_entry(side, step, price, gap):
-    icon = "🟢" if side == "BUY" else "🔴"
-    title = "ВХОД В ПОЗИЦИЮ" if step == 1 else "УСРЕДНЕНИЕ (ДОБОР)"
-    msg = (
-        f"{icon} *{title}* {icon}\n"
-        f"━━━━━━━━━━━━━━━\n"
-        f"🔹 *Инструмент:* `{SYMBOL_UPPER}`\n"
-        f"🔹 *Тип:* `{side}` (Шаг {step})\n"
-        f"💵 *Цена:* `{price}`\n"
-        f"📐 *Gap (Пружина):* `{gap:.5f}`\n"
-        f"🚀 *Плечо:* `x{LEVERAGE}`\n"
-        f"━━━━━━━━━━━━━━━"
-    )
-    send_tg(msg)
-
-def tg_report_close(side, steps, gap):
-    # Считаем средние показатели
-    avg_entry = sum(stats["entry_gaps"]) / len(stats["entry_gaps"]) if stats["entry_gaps"] else 0
-    avg_exit = sum(stats["exit_overshoots"]) / len(stats["exit_overshoots"]) if stats["exit_overshoots"] else 0
-    
-    msg = (
-        f"💰 *ФИКСАЦИЯ ПРИБЫЛИ* 💰\n"
-        f"━━━━━━━━━━━━━━━\n"
-        f"✅ *Позиция {side} закрыта*\n"
-        f"📈 *Шагов сетки:* `{steps}`\n"
-        f"🏁 *Gap на выходе:* `{gap:.5f}`\n"
-        f"📊 *Средний вход (сутки):* `-{abs(avg_entry):.4f}`\n"
-        f"🎯 *Средний пролет (сутки):* `+{abs(avg_exit):.4f}`\n"
-        f"🔢 *Всего сделок:* `{stats['total_trades']}`\n"
-        f"✨ *Профит в копилке!*"
-    )
-    send_tg(msg)
+        try:
+            url = f"https://api.telegram.org/bot{token}/sendMessage"
+            requests.post(url, json={"chat_id": chat_id, "text": text, "parse_mode": "Markdown"})
+        except Exception as e:
+            print(f"Ошибка TG: {e}")
 
 def get_ema(values, span):
     if len(values) < span: return values[-1]
     alpha = 2 / (span + 1)
     ema = values[0]
-    for val in values[1:]: ema = (val * alpha) + (ema * (1 - alpha))
+    for val in values[1:]:
+        ema = (val * alpha) + (ema * (1 - alpha))
     return ema
 
-def execute_order(side, step_num, gap):
-    try:
-        try: client.futures_change_margin_type(symbol=SYMBOL_UPPER, marginType='CROSSED')
-        except: pass
-        client.futures_change_leverage(symbol=SYMBOL_UPPER, leverage=LEVERAGE)
+def execute_order(side, price, gap):
+    global paper_vars
+    prefix = "📝 [PAPER]" if IS_PAPER_MODE else "🚀 [REAL]"
+    
+    # В Paper Mode при открытии новой сделки "закрываем" старую в уме
+    if IS_PAPER_MODE and paper_vars["side"] is not None:
+        p_factor = 1 if paper_vars["side"] == "BUY" else -1
+        profit = (price - paper_vars["entry_price"]) * paper_vars["pos_amt"] * p_factor
+        paper_vars["balance"] += profit
+        send_tg(f"💰 Промежуточный фикс: `${profit:.2f}`. Баланс: `${paper_vars['balance']:.2f}`")
 
-        price = closes[-1]
-        qty = round((MARGIN_STEP * LEVERAGE) / price, 2)
-        if qty < 0.1: qty = 0.1
-        
-        client.futures_create_order(symbol=SYMBOL_UPPER, side=side, type='MARKET', quantity=qty)
-        
-        # Записываем стат только для первого входа
-        if step_num == 1:
-            stats["entry_gaps"].append(gap)
-            
-        tg_report_entry(side, step_num, price, gap)
-        return True
-    except Exception as e:
-        send_tg(f"❌ *ОШИБКА ОРДЕРА*: `{e}`")
-        return False
+    if IS_PAPER_MODE:
+        paper_vars["side"] = side
+        paper_vars["entry_price"] = price
+        paper_vars["pos_amt"] = (MARGIN_STEP * LEVERAGE) / price
+        send_tg(f"{prefix} Вход {side} по `{price}`. Gap: `{gap:.5f}`")
+    else:
+        # Логика для реальных торгов на Binance
+        try:
+            client.futures_change_leverage(symbol=SYMBOL_UPPER, leverage=LEVERAGE)
+            qty = round((MARGIN_STEP * LEVERAGE) / price, 2)
+            if qty < 0.1: qty = 0.1
+            client.futures_create_order(symbol=SYMBOL_UPPER, side=side, type='MARKET', quantity=qty)
+            send_tg(f"{prefix} Реальный ордер {side} на `{qty}` исполнен.")
+        except Exception as e:
+            send_tg(f"❌ Ошибка Binance: `{e}`")
+
+def close_and_clear_paper(price):
+    global paper_vars
+    if paper_vars["side"] is not None:
+        p_factor = 1 if paper_vars["side"] == "BUY" else -1
+        profit = (price - paper_vars["entry_price"]) * paper_vars["pos_amt"] * p_factor
+        paper_vars["balance"] += profit
+        send_tg(f"🏁 СТОП ТРЕНД. Закрыто: `${profit:.2f}`. Баланс: `${paper_vars['balance']:.2f}`. Ждем новый крест.")
+        paper_vars["side"] = None
+        paper_vars["pos_amt"] = 0
 
 def process_candle(close_price):
-    global closes, last_log_time, current_steps, last_entry_gap
-    
+    global closes, max_stats, paper_vars
     closes.append(close_price)
-    if len(closes) > 100: closes.pop(0) # Увеличил до 100, чтобы EMA 99 работала, если захочешь
-    if len(closes) < 26: return
+    if len(closes) > 300: closes.pop(0)
+    if len(closes) < EMA_SLOW: return
 
-    # Твои любимые 7 и 25
-    f_now = get_ema(closes, 7)
-    s_now = get_ema(closes, 25)
-    gap = (f_now - s_now) / s_now 
+    f_ema = get_ema(closes, EMA_FAST)
+    s_ema = get_ema(closes, EMA_SLOW)
+    gap = (close_price - f_ema) / f_ema
 
-    if time.time() - last_log_time > 60:
-        print(f"💓 LIVE: {close_price} | Gap: {gap:.5f} | Step: {current_steps}", flush=True)
-        last_log_time = time.time()
+    # Статистика разрывов
+    if gap > max_stats["max_short_gap"]: max_stats["max_short_gap"] = gap
+    if gap < max_stats["max_long_gap"]: max_stats["max_long_gap"] = gap
 
-    try:
-        pos_info = client.futures_position_information(symbol=SYMBOL_UPPER)
-        my_pos = next((p for p in pos_info if p['symbol'] == SYMBOL_UPPER), None)
-        amt = float(my_pos['positionAmt']) if my_pos else 0
+    cross_up = f_ema > s_ema
+    cross_down = f_ema < s_ema
+    curr_side = paper_vars["side"]
+
+    # 1. ВХОД ПО ТРЕНДУ (Если вне позиции)
+    if curr_side is None:
+        if cross_up and gap >= TREND_CONFIRM:
+            execute_order("BUY", close_price, gap)
+        elif cross_down and gap <= -TREND_CONFIRM:
+            execute_order("SELL", close_price, gap)
+
+    # 2. ЛОГИКА В ПОЗИЦИИ
+    else:
+        # А) ПЕРЕВОРOT ПО "РЕЗИНКЕ" (0.009)
+        if curr_side == "BUY" and gap >= REVERSE_GAP:
+            send_tg(f"⚡️ ПЕРЕВОРOT! Резинка +{gap:.4f}. Входим в ШОРТ.")
+            execute_order("SELL", close_price, gap)
         
-        if amt == 0:
-            current_steps = 0
-            if gap <= -ENTRY_THRESHOLD:
-                if execute_order('BUY', 1, gap):
-                    current_steps, last_entry_gap = 1, gap
-            elif gap >= ENTRY_THRESHOLD:
-                if execute_order('SELL', 1, gap):
-                    current_steps, last_entry_gap = 1, gap
+        elif curr_side == "SELL" and gap <= -REVERSE_GAP:
+            send_tg(f"⚡️ ПЕРЕВОРOT! Резинка {gap:.4f}. Входим в ЛОНГ.")
+            execute_order("BUY", close_price, gap)
 
-        elif amt > 0: # LONG
-            if gap <= (last_entry_gap - STEP_DIFF) and current_steps < MAX_STEPS:
-                if execute_order('BUY', current_steps + 1, gap):
-                    current_steps += 1
-                    last_entry_gap = gap
-            elif gap >= EXIT_THRESHOLD:
-                client.futures_create_order(symbol=SYMBOL_UPPER, side='SELL', type='MARKET', quantity=amt, reduceOnly=True)
-                stats["exit_overshoots"].append(gap)
-                stats["total_trades"] += 1
-                tg_report_close("LONG", current_steps, gap)
-                current_steps = 0
+        # Б) ЗАКРЫТИЕ И ПЕРЕЗАХОД ПРИ ВОЗВРАТЕ К СРЕДНЕЙ (Твой сценарий)
+        # Если были в Шорте после переворота и цена ушла НИЖЕ средней на зазор
+        elif curr_side == "SELL" and cross_up and gap <= -TREND_CONFIRM:
+            send_tg("🎯 Возврат к средней пройден! Фикс Шорта -> Новый ЛОНГ по тренду")
+            execute_order("BUY", close_price, gap)
+            
+        elif curr_side == "BUY" and cross_down and gap >= TREND_CONFIRM:
+            send_tg("🎯 Возврат к средней пройден! Фикс Лонга -> Новый ШОРТ по тренду")
+            execute_order("SELL", close_price, gap)
 
-        elif amt < 0: # SHORT
-            if gap >= (last_entry_gap + STEP_DIFF) and current_steps < MAX_STEPS:
-                if execute_order('SELL', current_steps + 1, gap):
-                    current_steps += 1
-                    last_entry_gap = gap
-            elif gap <= -EXIT_THRESHOLD:
-                client.futures_create_order(symbol=SYMBOL_UPPER, side='BUY', type='MARKET', quantity=abs(amt), reduceOnly=True)
-                stats["exit_overshoots"].append(gap)
-                stats["total_trades"] += 1
-                tg_report_close("SHORT", current_steps, gap)
-                current_steps = 0
-
-    except Exception as e:
-        print(f"⚠️ Ошибка: {e}", flush=True)
+        # В) ОКОНЧАТЕЛЬНЫЙ ВЫХОД ПРИ ПЕРЕСЕЧЕНИИ EMA
+        if (curr_side == "BUY" and cross_down) or (curr_side == "SELL" and cross_up):
+            close_and_clear_paper(close_price)
 
 def start_socket():
     url = f"wss://fstream.binance.com/ws/{SYMBOL_LOWER}@kline_1m"
-    def on_msg(ws, msg):
+    def on_message(ws, msg):
         js = json.loads(msg)
-        if js['k']['x']: 
-            process_candle(float(js['k']['c']))
-    
-    ws = websocket.WebSocketApp(url, on_message=on_msg, on_error=lambda w,e: print(f"Socket Err: {e}"), 
-                                on_close=lambda w,a,b: [time.sleep(5), start_socket()])
+        if js['k']['x']: process_candle(float(js['k']['c']))
+    def on_error(ws, err): print(f"Socket Error: {err}")
+    def on_close(ws, a, b): 
+        time.sleep(5)
+        start_socket()
+    ws = websocket.WebSocketApp(url, on_message=on_message, on_error=on_error, on_close=on_close)
     ws.run_forever()
 
 threading.Thread(target=start_socket, daemon=True).start()
 
 @app.route('/')
-def idx(): 
-    return f"Snake Bot 5.4 Stats Edition. Total Trades: {stats['total_trades']}"
+def index():
+    status = "PAPER" if IS_PAPER_MODE else "REAL"
+    return {
+        "mode": status,
+        "balance": f"{paper_vars['balance']:.2f}$",
+        "current_side": paper_vars["side"],
+        "max_up": f"{max_stats['max_short_gap']:.5f}",
+        "max_down": f"{max_stats['max_long_gap']:.5f}"
+    }
 
 if __name__ == "__main__":
     app.run(host='0.0.0.0', port=int(os.environ.get("PORT", 10000)))
