@@ -14,7 +14,7 @@ SYMBOL_LOWER = "solusdt"   # Для WebSocket
 EMA_FAST = 25
 EMA_SLOW = 99
 TREND_CONFIRM = 0.0005     # Зазор 0.05% для входа/перезахода
-REVERSE_GAP = 0.009        # "Резинка" 0.9% для переворота
+REVERSE_GAP = 0.003        # "Резинка" 0.9% для переворота
 
 # Параметры депозита
 LEVERAGE = 30
