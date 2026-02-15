@@ -11,7 +11,7 @@ SYMBOL_LOWER = "solusdt"
 
 ENTRY_MIN_GAP = 0.003      # Начинаем слежку для ВХОДА при 0.3%
 EXIT_MIN_GAP = 0.0005      # Начинаем слежку для ВЫХОДА при 0.05%
-PULLBACK_RATE = 0.10       # Откат от пика для действия (10%)
+PULLBACK_RATE = 0.07       # Откат от пика для действия (10%)
 
 LEVERAGE = 30              
 MARGIN_STEP = 10.0          # Фиксированная ставка
@@ -126,7 +126,25 @@ def start_socket():
 threading.Thread(target=start_socket, daemon=True).start()
 
 @app.route('/')
-def idx(): return f"Snake Isolated V6. Total Trades: {stats['total_trades']}"
+def idx():
+    import requests
+    try:
+        # Узнаем наш реальный внешний IP через сторонний сервис
+        current_ip = requests.get('https://api.ipify.org').text
+        
+        # Заодно проверим пинг до биржи
+        start = time.time()
+        client.futures_ping()
+        latency = (time.time() - start) * 1000
+        
+        return f"""
+        <h1>Snake Bot Status</h1>
+        <p><b>Твой IP для Binance:</b> <span style="color: red; font-size: 24px;">{current_ip}</span></p>
+        <p><b>Пинг до Токио:</b> {latency:.2f} мс</p>
+        <p>Скопируй этот IP и вставь его в WhiteList на Binance.</p>
+        """
+    except Exception as e:
+        return f"Ошибка при получении данных: {e}"
 
 if __name__ == "__main__":
     app.run(host='0.0.0.0', port=int(os.environ.get("PORT", 10000)))
