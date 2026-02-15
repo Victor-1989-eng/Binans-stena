@@ -62,12 +62,12 @@ def process_candle(close_price):
     global closes, last_log_time, peak_gap
     
     closes.append(close_price)
-    if len(closes) > 150: closes.pop(0) 
-    if len(closes) < 99: return 
+    if len(closes) > 100: closes.pop(0) 
+    if len(closes) < 26: return 
 
     # Твои 25 и 99
-    f_now = get_ema(closes, 25)
-    s_now = get_ema(closes, 99)
+    f_now = get_ema(closes, 7)
+    s_now = get_ema(closes, 25)
     gap = (f_now - s_now) / s_now 
 
     if time.time() - last_log_time > 60:
