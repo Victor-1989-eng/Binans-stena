@@ -5,31 +5,31 @@ import websocket
 
 app = Flask(__name__)
 
-# ================= НАСТРОЙКИ (ИЗОЛИРОВАННАЯ МАРЖА / БЕЗ УСРЕДНЕНИЯ) =================
+# ================= НАСТРОЙКИ (ИЗОЛИРОВАННАЯ МАРЖА И СБЛИЖЕНИЕ) =================
 SYMBOL_UPPER = "SOLUSDT"
 SYMBOL_LOWER = "solusdt" 
 
-ENTRY_MIN_GAP = 0.002      # Начинаем слежку для ВХОДА
-EXIT_MIN_GAP = 0.0005      # Начинаем слежку для ВЫХОДА (пролет за среднюю)
-PULLBACK_RATE = 0.10       # Откат 10% от пика для входа/выхода
+ENTRY_MIN_GAP = 0.003      # Начинаем слежку для ВХОДА при 0.3%
+EXIT_MIN_GAP = 0.0005      # Начинаем слежку для ВЫХОДА при 0.05%
+PULLBACK_RATE = 0.10       # Откат от пика для действия (10%)
 
 LEVERAGE = 30              
-MARGIN_STEP = 10.0          # Сумма одной сделки (с плечом x30 это 300$ в рынке)
-# ===================================================================================
+MARGIN_STEP = 10.0          # Фиксированная ставка
+# ==============================================================================
 
 client = Client(os.environ.get("BINANCE_API_KEY"), os.environ.get("BINANCE_API_SECRET"))
 closes = []
 last_log_time = 0
-peak_gap = 0               # Трекер пика
+peak_gap = 0               # Трекер экстремума
 
-stats = {"entry_gaps": [], "exit_overshoots": [], "total_trades": 0}
+stats = {"total_trades": 0}
 
 def send_tg(text):
     token, chat_id = os.environ.get("TELEGRAM_TOKEN"), os.environ.get("CHAT_ID")
     if token and chat_id:
         try: requests.post(f"https://api.telegram.org/bot{token}/sendMessage", 
                            json={"chat_id": chat_id, "text": text, "parse_mode": "Markdown"})
-    except: pass
+        except: pass
 
 def get_ema(values, span):
     if len(values) < span: return values[-1]
@@ -40,9 +40,9 @@ def get_ema(values, span):
 
 def execute_order(side, gap):
     try:
-        # УСТАНОВКА ИЗОЛИРОВАННОЙ МАРЖИ
+        # ПЕРЕКЛЮЧЕНИЕ НА ИЗОЛИРОВАННУЮ МАРЖУ
         try: client.futures_change_margin_type(symbol=SYMBOL_UPPER, marginType='ISOLATED')
-        except: pass # Если уже изолированная, пропустит
+        except: pass 
         
         client.futures_change_leverage(symbol=SYMBOL_UPPER, leverage=LEVERAGE)
         
@@ -51,7 +51,6 @@ def execute_order(side, gap):
         if qty < 0.1: qty = 0.1
         
         client.futures_create_order(symbol=SYMBOL_UPPER, side=side, type='MARKET', quantity=qty)
-        stats["entry_gaps"].append(gap)
         
         icon = "🟢" if side == "BUY" else "🔴"
         send_tg(f"{icon} *ВХОД {side}*\n📐 Gap: `{gap:.5f}`\n💵 Цена: `{price}`")
@@ -82,14 +81,14 @@ def process_candle(close_price):
         
         # --- ЛОГИКА ВХОДА (СБЛИЖЕНИЕ) ---
         if amt == 0:
-            if gap >= ENTRY_MIN_GAP: # Ищем пик для SELL
+            if gap >= ENTRY_MIN_GAP: # Ищем пик наверху
                 if gap > peak_gap: peak_gap = gap
-                elif gap < peak_gap * (1 - PULLBACK_RATE):
+                elif gap < peak_gap * (1 - PULLBACK_RATE): # Сближение
                     if execute_order('SELL', gap): peak_gap = 0
             
-            elif gap <= -ENTRY_MIN_GAP: # Ищем пик для BUY
+            elif gap <= -ENTRY_MIN_GAP: # Ищем пик внизу
                 if gap < peak_gap: peak_gap = gap
-                elif gap > peak_gap * (1 - PULLBACK_RATE):
+                elif gap > peak_gap * (1 - PULLBACK_RATE): # Сближение
                     if execute_order('BUY', gap): peak_gap = 0
             else:
                 peak_gap = 0
@@ -98,19 +97,19 @@ def process_candle(close_price):
         elif amt > 0: # В ЛОНГЕ
             if gap >= EXIT_MIN_GAP:
                 if gap > peak_gap: peak_gap = gap
-                elif gap < peak_gap * (1 - PULLBACK_RATE):
+                elif gap < peak_gap * (1 - PULLBACK_RATE): # Сближение к средней
                     client.futures_create_order(symbol=SYMBOL_UPPER, side='SELL', type='MARKET', quantity=amt, reduceOnly=True)
                     stats["total_trades"] += 1
-                    send_tg(f"💰 *ФИКС ЛОНГ*\n🏁 Gap: `{gap:.5f}`")
+                    send_tg(f"💰 *ФИКС ЛОНГ* | Gap: `{gap:.5f}`")
                     peak_gap = 0 # Сразу готов к новому входу
 
         elif amt < 0: # В ШОРТЕ
             if gap <= -EXIT_MIN_GAP:
                 if gap < peak_gap: peak_gap = gap
-                elif gap > peak_gap * (1 - PULLBACK_RATE):
+                elif gap > peak_gap * (1 - PULLBACK_RATE): # Сближение к средней
                     client.futures_create_order(symbol=SYMBOL_UPPER, side='BUY', type='MARKET', quantity=abs(amt), reduceOnly=True)
                     stats["total_trades"] += 1
-                    send_tg(f"💰 *ФИКС ШОРТ*\n🏁 Gap: `{gap:.5f}`")
+                    send_tg(f"💰 *ФИКС ШОРТ* | Gap: `{gap:.5f}`")
                     peak_gap = 0 # Сразу готов к новому входу
 
     except Exception as e:
@@ -127,7 +126,7 @@ def start_socket():
 threading.Thread(target=start_socket, daemon=True).start()
 
 @app.route('/')
-def idx(): return f"Snake Bot Isolated. Trades: {stats['total_trades']}"
+def idx(): return f"Snake Isolated V6. Total Trades: {stats['total_trades']}"
 
 if __name__ == "__main__":
     app.run(host='0.0.0.0', port=int(os.environ.get("PORT", 10000)))
