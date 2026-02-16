@@ -5,50 +5,57 @@ import websocket
 
 app = Flask(__name__)
 
-# ================= НАСТРОЙКИ (ОХОТНИК V6.2 - ANTI-BAN) =================
+# ================= НАСТРОЙКИ (ОХОТНИК V6.2.1) =================
 SYMBOL_UPPER = "SOLUSDT"
 SYMBOL_LOWER = "solusdt" 
 
-ENTRY_MIN_GAP = 0.003      # Начинаем слежку для ВХОДА (0.3%)
-EXIT_MIN_GAP = 0.0005      # Начинаем слежку для ВЫХОДА (0.05%)
-PULLBACK_RATE = 0.07       # Откат от пика для действия (12%)
-
-# НАСТРОЙКА БЕЗУБЫТКА: 1.0 = вход. Меньше 1.0 = жестче, Больше 1.0 = свободнее.
+ENTRY_MIN_GAP = 0.003      # 0.3%
+EXIT_MIN_GAP = 0.0005      # 0.05%
+PULLBACK_RATE = 0.07       # 12%
 REVERSE_LEVEL_COEFF = 2.0  
-
 LEVERAGE = 30              
-MARGIN_STEP = 10.0          # Сумма одной сделки (Isolated)
+MARGIN_STEP = 10.0         
 # =====================================================================
 
-client = Client(os.environ.get("BINANCE_API_KEY"), os.environ.get("BINANCE_API_SECRET"))
+# Инициализация клиента
+api_key = os.environ.get("BINANCE_API_KEY")
+api_secret = os.environ.get("BINANCE_API_SECRET")
+client = Client(api_key, api_secret)
+
 closes = []
 last_log_time = 0
 peak_gap = 0               
 stats = {"total_trades": 0}
-
-# Глобальные переменные для экономии запросов к API
 current_amt = 0
 last_pos_check = 0
 
 def send_tg(text):
-    token, chat_id = os.environ.get("TELEGRAM_TOKEN"), os.environ.get("CHAT_ID")
+    token = os.environ.get("TELEGRAM_TOKEN")
+    chat_id = os.environ.get("CHAT_ID")
     if token and chat_id:
-        try: requests.post(f"https://api.telegram.org/bot{token}/sendMessage", 
-                           json={"chat_id": chat_id, "text": text, "parse_mode": "Markdown"})
-    except: pass
+        try:
+            url = f"https://api.telegram.org/bot{token}/sendMessage"
+            requests.post(url, json={"chat_id": chat_id, "text": text, "parse_mode": "Markdown"})
+        except Exception as e:
+            print(f"TG Error: {e}")
 
 def get_ema(values, span):
     if len(values) < span: return values[-1]
     alpha = 2 / (span + 1)
     ema = values[0]
-    for val in values[1:]: ema = (val * alpha) + (ema * (1 - alpha))
+    for val in values[1:]:
+        ema = (val * alpha) + (ema * (1 - alpha))
     return ema
 
 def execute_order(side, gap):
     global current_amt, last_pos_check
     try:
-        try: client.futures_change_margin_type(symbol=SYMBOL_UPPER, marginType='ISOLATED')
-        except: pass 
+        # Пытаемся установить тип маржи и плечо
+        try:
+            client.futures_change_margin_type(symbol=SYMBOL_UPPER, marginType='ISOLATED')
+        except:
+            pass 
+        
         client.futures_change_leverage(symbol=SYMBOL_UPPER, leverage=LEVERAGE)
         
         price = closes[-1]
@@ -57,14 +64,14 @@ def execute_order(side, gap):
         
         client.futures_create_order(symbol=SYMBOL_UPPER, side=side, type='MARKET', quantity=qty)
         
-        # Заставляем бота проверить позицию на следующей свече
-        last_pos_check = 0 
+        last_pos_check = 0 # Сброс для проверки позиции
         
         icon = "🟢" if side == "BUY" else "🔴"
         send_tg(f"{icon} *ВХОД {side}*\n📐 Gap: `{gap:.5f}`\n💵 Цена: `{price}`")
         return True
     except Exception as e:
-        send_tg(f"❌ *ОШИБКА ВХОДА*: `{e}`"); return False
+        send_tg(f"❌ *ОШИБКА ВХОДА*: `{e}`")
+        return False
 
 def process_candle(close_price):
     global closes, last_log_time, peak_gap, current_amt, last_pos_check
@@ -82,7 +89,7 @@ def process_candle(close_price):
         last_log_time = time.time()
 
     try:
-        # ОБНОВЛЯЕМ ПОЗИЦИЮ РАЗ В 10 МИНУТ (ЧТОБЫ НЕ БАНИЛИ IP)
+        # Проверка позиции раз в 10 минут
         if time.time() - last_pos_check > 600:
             pos_info = client.futures_position_information(symbol=SYMBOL_UPPER)
             my_pos = next((p for p in pos_info if p['symbol'] == SYMBOL_UPPER), None)
@@ -92,13 +99,11 @@ def process_candle(close_price):
 
         amt = current_amt
         
-        # --- ЛОГИКА ВХОДА ---
         if amt == 0:
             if gap >= ENTRY_MIN_GAP:
                 if gap > peak_gap: peak_gap = gap
                 elif gap < peak_gap * (1 - PULLBACK_RATE):
                     if execute_order('SELL', gap): peak_gap = 0
-            
             elif gap <= -ENTRY_MIN_GAP:
                 if gap < peak_gap: peak_gap = gap
                 elif gap > peak_gap * (1 - PULLBACK_RATE):
@@ -106,15 +111,13 @@ def process_candle(close_price):
             else:
                 peak_gap = 0
 
-        # --- ЛОГИКА ВЫХОДА ---
-        elif amt > 0: # В ЛОНГЕ
+        elif amt > 0: # LONG
             reverse_level = -ENTRY_MIN_GAP * REVERSE_LEVEL_COEFF
             if peak_gap >= EXIT_MIN_GAP and gap <= reverse_level:
                  client.futures_create_order(symbol=SYMBOL_UPPER, side='SELL', type='MARKET', quantity=amt, reduceOnly=True)
                  last_pos_check = 0 
                  send_tg(f"⚠️ *РЕВЕРС LONG*")
                  peak_gap = 0 
-            
             elif gap >= EXIT_MIN_GAP:
                 if gap > peak_gap: peak_gap = gap
                 elif gap < peak_gap * (1 - PULLBACK_RATE):
@@ -124,14 +127,13 @@ def process_candle(close_price):
                     send_tg(f"💰 *ФИКС ЛОНГ*")
                     peak_gap = 0
 
-        elif amt < 0: # В ШОРТЕ
+        elif amt < 0: # SHORT
             reverse_level = ENTRY_MIN_GAP * REVERSE_LEVEL_COEFF
             if peak_gap <= -EXIT_MIN_GAP and gap >= reverse_level:
                  client.futures_create_order(symbol=SYMBOL_UPPER, side='BUY', type='MARKET', quantity=abs(amt), reduceOnly=True)
                  last_pos_check = 0
                  send_tg(f"⚠️ *РЕВЕРС SHORT*")
                  peak_gap = 0
-
             elif gap <= -EXIT_MIN_GAP:
                 if gap < peak_gap: peak_gap = gap
                 elif gap > peak_gap * (1 - PULLBACK_RATE):
@@ -142,37 +144,35 @@ def process_candle(close_price):
                     peak_gap = 0
 
     except Exception as e:
-        print(f"⚠️ Ошибка: {e}", flush=True)
+        print(f"⚠️ Ошибка логики: {e}", flush=True)
 
 def start_socket():
     url = f"wss://fstream.binance.com/ws/{SYMBOL_LOWER}@kline_1m"
-    def on_msg(ws, msg):
+    def on_message(ws, msg):
         js = json.loads(msg)
         if js['k']['x']: process_candle(float(js['k']['c']))
     def on_error(ws, err): print(f"WS Error: {err}")
     def on_close(ws, c, m): 
-        print("WS Closed. Reconnecting..."); time.sleep(5); start_socket()
+        print("WS Closed. Reconnecting...")
+        time.sleep(5)
+        start_socket()
     
-    ws = websocket.WebSocketApp(url, on_message=on_msg, on_error=on_error, on_close=on_close)
+    ws = websocket.WebSocketApp(url, on_message=on_message, on_error=on_error, on_close=on_close)
     ws.run_forever()
 
 threading.Thread(target=start_socket, daemon=True).start()
 
 @app.route('/')
 def idx():
-    import requests
     try:
         current_ip = requests.get('https://api.ipify.org').text
         start = time.time()
         client.futures_ping()
         latency = (time.time() - start) * 1000
-        return f"""
-        <h1>Snake Bot V6.2 (Anti-Ban)</h1>
-        <p><b>IP:</b> <span style="color:red">{current_ip}</span></p>
-        <p><b>Ping:</b> {latency:.2f} ms</p>
-        <p><b>Trades:</b> {stats['total_trades']}</p>
-        """
-    except Exception as e: return f"Error: {e}"
+        return f"<h1>Snake V6.2.1</h1><p>IP: {current_ip}</p><p>Ping: {latency:.2f} ms</p>"
+    except Exception as e:
+        return f"Error: {e}"
 
 if __name__ == "__main__":
-    app.run(host='0.0.0.0', port=int(os.environ.get("PORT", 10000)))
+    port = int(os.environ.get("PORT", 10000))
+    app.run(host='0.0.0.0', port=port)
