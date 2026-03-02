@@ -7,11 +7,11 @@ app = Flask(__name__)
 TOKEN = os.environ.get("TELEGRAM_TOKEN", "")
 CHAT_ID = os.environ.get("CHAT_ID", "")
 
-# Список (сделаем его максимально коротким для теста связи)
-TEST_ITEMS = ["T4_BAG", "T5_BAG", "T6_BAG", "T4_CAPE", "T5_CAPE", "T4_MAIN_SPEAR"]
+# Список популярных предметов
+TEST_ITEMS = "T4_BAG,T5_BAG,T6_BAG,T4_CAPE,T5_CAPE,T4_MAIN_SPEAR,T5_MAIN_SPEAR,T4_MAIN_BOW"
 
 current_deals = []
-last_error = "Ошибок пока нет. Ждем первый цикл..."
+last_error = "Ожидание данных..."
 
 def send_tg(text):
     if TOKEN and CHAT_ID:
@@ -25,41 +25,47 @@ def scan_logic():
     while True:
         new_found = []
         try:
-            # Запрашиваем по 1 группе для стабильности
-            items_str = ",".join(TEST_ITEMS)
-            url = f"https://www.albion-online-data.com/api/v2/stats/prices/{items_str}?locations=Caerleon,BlackMarket&qualities=1,2,3"
-            
-            print(f"DEBUG: Запрос к {url}", flush=True)
+            url = f"https://www.albion-online-data.com/api/v2/stats/prices/{TEST_ITEMS}?locations=Caerleon,BlackMarket&qualities=1,2,3"
             response = requests.get(url, timeout=30)
             
-            if response.status_code != 200:
-                last_error = f"API вернул статус {response.status_code}. Возможно, временный бан IP."
-            else:
+            if response.status_code == 200:
                 data = response.json()
-                if not data:
-                    last_error = "API прислал пустой список. Возможно, никто не обновлял цены сегодня."
+                if not data or not isinstance(data, list):
+                    last_error = "API вернул пустой список или некорректный формат."
                 else:
-                    last_error = "Данные успешно получены! Обработка..."
                     market_data = {}
                     for row in data:
-                        k = (row['item_id'], row['quality'])
-                        if k not in market_data: market_data[k] = {}
-                        market_data[k][row['location']] = row['sell_price_min']
+                        # Проверка, что в строке есть все нужные ключи, чтобы не было ошибки 'location'
+                        if all(k in row for k in ('item_id', 'quality', 'location', 'sell_price_min')):
+                            k = (row['item_id'], row['quality'])
+                            if k not in market_data: market_data[k] = {}
+                            market_data[k][row['location']] = row['sell_price_min']
 
                     for (item_id, qual), locs in market_data.items():
                         p_city = locs.get('Caerleon', 0)
                         p_bm = locs.get('BlackMarket', 0)
+                        
+                        # Если обе цены больше нуля
                         if p_city > 0 and p_bm > 0:
                             profit = p_bm - p_city - (p_bm * 0.09)
-                            if profit > 1000:
-                                new_found.append({"name": item_id, "q": qual, "buy": p_city, "sell": p_bm, "profit": int(profit)})
+                            if profit > 2000:
+                                new_found.append({
+                                    "name": item_id, 
+                                    "q": qual, 
+                                    "buy": p_city, 
+                                    "sell": p_bm, 
+                                    "profit": int(profit)
+                                })
+                                if profit > 50000:
+                                    send_tg(f"💰 *Black Market Alert!*\n`{item_id}`\nProfit: {int(profit):,} silver")
                     
                     current_deals = sorted(new_found, key=lambda x: x['profit'], reverse=True)
-                    last_error = f"Последнее обновление: {time.strftime('%H:%M:%S')}. Найдено сделок: {len(current_deals)}"
+                    last_error = f"Обновлено в {time.strftime('%H:%M:%S')}. Найдено сделок: {len(current_deals)}"
+            else:
+                last_error = f"Ошибка API: статус {response.status_code}"
 
         except Exception as e:
-            last_error = f"Критическая ошибка потока: {str(e)}"
-            print(f"ERROR: {e}", flush=True)
+            last_error = f"Ошибка обработки: {str(e)}"
         
         time.sleep(60)
 
@@ -67,11 +73,7 @@ threading.Thread(target=scan_logic, daemon=True).start()
 
 @app.route('/')
 def index():
-    # Выводим статус и ошибки прямо на страницу
-    status_html = f"<div style='color: yellow; padding: 10px; border: 1px solid yellow;'>Статус: {last_error}</div>"
-    
-    if not current_deals:
-        return f"<html><body style='background:#121212;color:white;'><h1>🏴‍☠️ Albion Scanner</h1>{status_html}</body></html>"
+    status_style = "color: #00ff00;" if "Обновлено" in last_error else "color: yellow;"
     
     table_rows = ""
     for d in current_deals:
@@ -80,11 +82,13 @@ def index():
     return f"""
     <html>
     <body style="background:#121212; color:white; font-family:sans-serif; padding:20px;">
-        <h1>🏴‍☠️ Caerleon Flip Dashboard</h1>
-        {status_html}
-        <table border="1" style="width:100%; border-collapse:collapse; margin-top:20px;">
-            <tr style="background:#333;"><th>Item</th><th>Quality</th><th>Buy Market</th><th>Sell BM</th><th>Profit</th></tr>
-            {table_rows}
+        <h2>🏴‍☠️ Albion Caerleon Scanner</h2>
+        <div style="padding: 10px; border: 1px solid #444; margin-bottom: 20px; {status_style}">
+            {last_error}
+        </div>
+        <table border="1" style="width:100%; border-collapse:collapse;">
+            <tr style="background:#333;"><th>Предмет</th><th>Кач-во</th><th>Рынок</th><th>ЧР</th><th>Профит</th></tr>
+            {table_rows if table_rows else '<tr><td colspan="5" style="text-align:center;">Пока нет выгодных сделок. Листай рынок в игре!</td></tr>'}
         </table>
     </body>
     </html>
