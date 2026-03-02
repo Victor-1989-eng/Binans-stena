@@ -1,178 +1,110 @@
-import os, json, time, threading, requests
-from flask import Flask
-from binance.client import Client
-import websocket 
+import os, requests, time, threading
+from flask import Flask, render_template_string
 
 app = Flask(__name__)
 
-# ================= НАСТРОЙКИ (ОХОТНИК V6.2.1) =================
-SYMBOL_UPPER = "SOLUSDT"
-SYMBOL_LOWER = "solusdt" 
+# Настройки из твоих секретов (в Render добавь их в Environment Variables)
+TOKEN = os.environ.get("TELEGRAM_TOKEN")
+CHAT_ID = os.environ.get("CHAT_ID")
 
-ENTRY_MIN_GAP = 0.003      # 0.3%
-EXIT_MIN_GAP = 0.0005      # 0.05%
-PULLBACK_RATE = 0.07       # 12%
-REVERSE_LEVEL_COEFF = 2.0  
-LEVERAGE = 30              
-MARGIN_STEP = 10.0         
-# =====================================================================
+# СПИСОК "BEAST MODE" (Сгруппирован для обхода лимитов API)
+ITEM_GROUPS = [
+    "T4_BAG,T5_BAG,T6_BAG,T7_BAG,T8_BAG,T4_CAPE,T5_CAPE,T6_CAPE,T7_CAPE,T8_CAPE",
+    "T4_MAIN_SPEAR,T5_MAIN_SPEAR,T6_MAIN_SPEAR,T4_MAIN_BOW,T5_MAIN_BOW,T6_MAIN_BOW",
+    "T4_MAIN_SWORD,T5_MAIN_SWORD,T6_MAIN_SWORD,T4_MAIN_AXE,T5_MAIN_AXE,T6_MAIN_AXE",
+    "T4_ARMOR_PLATE_SET1,T5_ARMOR_PLATE_SET1,T6_ARMOR_PLATE_SET1,T4_ARMOR_LEATHER_SET1,T5_ARMOR_LEATHER_SET1",
+    "T4_SHOES_CLOTH_SET1,T5_SHOES_CLOTH_SET1,T6_SHOES_CLOTH_SET1,T4_HEAD_PLATE_SET1,T5_HEAD_PLATE_SET1"
+]
 
-# Инициализация клиента
-api_key = os.environ.get("BINANCE_API_KEY")
-api_secret = os.environ.get("BINANCE_API_SECRET")
-client = Client(api_key, api_secret)
-
-closes = []
-last_log_time = 0
-peak_gap = 0               
-stats = {"total_trades": 0}
-current_amt = 0
-last_pos_check = 0
+# Глобальное хранилище данных
+current_deals = []
 
 def send_tg(text):
-    token = os.environ.get("TELEGRAM_TOKEN")
-    chat_id = os.environ.get("CHAT_ID")
-    if token and chat_id:
+    if TOKEN and CHAT_ID:
         try:
-            url = f"https://api.telegram.org/bot{token}/sendMessage"
-            requests.post(url, json={"chat_id": chat_id, "text": text, "parse_mode": "Markdown"})
-        except Exception as e:
-            print(f"TG Error: {e}")
+            url = f"https://api.telegram.org/bot{TOKEN}/sendMessage"
+            requests.post(url, json={"chat_id": CHAT_ID, "text": text, "parse_mode": "Markdown"})
+        except: pass
 
-def get_ema(values, span):
-    if len(values) < span: return values[-1]
-    alpha = 2 / (span + 1)
-    ema = values[0]
-    for val in values[1:]:
-        ema = (val * alpha) + (ema * (1 - alpha))
-    return ema
+def scan_logic():
+    global current_deals
+    while True:
+        all_found = []
+        for group in ITEM_GROUPS:
+            try:
+                # Запрашиваем Карлеон и Черный Рынок, качества: Обычное, Хорошее, Выдающееся
+                url = f"https://www.albion-online-data.com/api/v2/stats/prices/{group}?locations=Caerleon,BlackMarket&qualities=1,2,3"
+                data = requests.get(url, timeout=10).json()
+                
+                pairs = {}
+                for entry in data:
+                    key = (entry['item_id'], entry['quality'])
+                    if key not in pairs: pairs[key] = {}
+                    pairs[key][entry['location']] = entry['sell_price_min']
 
-def execute_order(side, gap):
-    global current_amt, last_pos_check
-    try:
-        # Пытаемся установить тип маржи и плечо
-        try:
-            client.futures_change_margin_type(symbol=SYMBOL_UPPER, marginType='ISOLATED')
-        except:
-            pass 
+                for (item_id, quality), locs in pairs.items():
+                    p_city = locs.get('Caerleon', 0)
+                    p_bm = locs.get('BlackMarket', 0)
+
+                    if p_city > 0 and p_bm > 0:
+                        # Налог ЧР (6%) + комиссия за выставление (2.5%) = 8.5%
+                        profit = p_bm - p_city - (p_bm * 0.085)
+
+                        if profit > 10000: # Порог прибыли для таблицы
+                            all_found.append({
+                                "name": item_id,
+                                "q": quality,
+                                "buy": p_city,
+                                "sell": p_bm,
+                                "profit": round(profit, 2)
+                            })
+                            
+                            # Уведомление в ТГ только для жирных сделок (> 40k silver)
+                            if profit > 40000:
+                                send_tg(f"💰 *ФЛИП В КАРЛЕОНЕ*\n`{item_id}` (Q:{quality})\n🛒 Купи: {p_city:,}\n🏴‍☠️ ЧР: {p_bm:,}\n*Earned {round(profit, 2):,} silver*")
+            except: continue
+            time.sleep(2) # Пауза между группами
         
-        client.futures_change_leverage(symbol=SYMBOL_UPPER, leverage=LEVERAGE)
-        
-        price = closes[-1]
-        qty = round((MARGIN_STEP * LEVERAGE) / price, 2)
-        if qty < 0.1: qty = 0.1
-        
-        client.futures_create_order(symbol=SYMBOL_UPPER, side=side, type='MARKET', quantity=qty)
-        
-        last_pos_check = 0 # Сброс для проверки позиции
-        
-        icon = "🟢" if side == "BUY" else "🔴"
-        send_tg(f"{icon} *ВХОД {side}*\n📐 Gap: `{gap:.5f}`\n💵 Цена: `{price}`")
-        return True
-    except Exception as e:
-        send_tg(f"❌ *ОШИБКА ВХОДА*: `{e}`")
-        return False
+        current_deals = sorted(all_found, key=lambda x: x['profit'], reverse=True)
+        time.sleep(180) # Обновляем раз в 3 минуты
 
-def process_candle(close_price):
-    global closes, last_log_time, peak_gap, current_amt, last_pos_check
-    
-    closes.append(close_price)
-    if len(closes) > 100: closes.pop(0) 
-    if len(closes) < 26: return 
-
-    f_now = get_ema(closes, 7)
-    s_now = get_ema(closes, 25)
-    gap = (f_now - s_now) / s_now 
-
-    if time.time() - last_log_time > 60:
-        print(f"💓 LIVE: {close_price} | Gap: {gap:.5f} | Peak: {peak_gap:.5f}", flush=True)
-        last_log_time = time.time()
-
-    try:
-        # Проверка позиции раз в 10 минут
-        if time.time() - last_pos_check > 600:
-            pos_info = client.futures_position_information(symbol=SYMBOL_UPPER)
-            my_pos = next((p for p in pos_info if p['symbol'] == SYMBOL_UPPER), None)
-            current_amt = float(my_pos['positionAmt']) if my_pos else 0
-            last_pos_check = time.time()
-            print(f"🔄 Синхронизация: {current_amt}")
-
-        amt = current_amt
-        
-        if amt == 0:
-            if gap >= ENTRY_MIN_GAP:
-                if gap > peak_gap: peak_gap = gap
-                elif gap < peak_gap * (1 - PULLBACK_RATE):
-                    if execute_order('SELL', gap): peak_gap = 0
-            elif gap <= -ENTRY_MIN_GAP:
-                if gap < peak_gap: peak_gap = gap
-                elif gap > peak_gap * (1 - PULLBACK_RATE):
-                    if execute_order('BUY', gap): peak_gap = 0
-            else:
-                peak_gap = 0
-
-        elif amt > 0: # LONG
-            reverse_level = -ENTRY_MIN_GAP * REVERSE_LEVEL_COEFF
-            if peak_gap >= EXIT_MIN_GAP and gap <= reverse_level:
-                 client.futures_create_order(symbol=SYMBOL_UPPER, side='SELL', type='MARKET', quantity=amt, reduceOnly=True)
-                 last_pos_check = 0 
-                 send_tg(f"⚠️ *РЕВЕРС LONG*")
-                 peak_gap = 0 
-            elif gap >= EXIT_MIN_GAP:
-                if gap > peak_gap: peak_gap = gap
-                elif gap < peak_gap * (1 - PULLBACK_RATE):
-                    client.futures_create_order(symbol=SYMBOL_UPPER, side='SELL', type='MARKET', quantity=amt, reduceOnly=True)
-                    last_pos_check = 0 
-                    stats["total_trades"] += 1
-                    send_tg(f"💰 *ФИКС ЛОНГ*")
-                    peak_gap = 0
-
-        elif amt < 0: # SHORT
-            reverse_level = ENTRY_MIN_GAP * REVERSE_LEVEL_COEFF
-            if peak_gap <= -EXIT_MIN_GAP and gap >= reverse_level:
-                 client.futures_create_order(symbol=SYMBOL_UPPER, side='BUY', type='MARKET', quantity=abs(amt), reduceOnly=True)
-                 last_pos_check = 0
-                 send_tg(f"⚠️ *РЕВЕРС SHORT*")
-                 peak_gap = 0
-            elif gap <= -EXIT_MIN_GAP:
-                if gap < peak_gap: peak_gap = gap
-                elif gap > peak_gap * (1 - PULLBACK_RATE):
-                    client.futures_create_order(symbol=SYMBOL_UPPER, side='BUY', type='MARKET', quantity=abs(amt), reduceOnly=True)
-                    last_pos_check = 0
-                    stats["total_trades"] += 1
-                    send_tg(f"💰 *ФИКС ШОРТ*")
-                    peak_gap = 0
-
-    except Exception as e:
-        print(f"⚠️ Ошибка логики: {e}", flush=True)
-
-def start_socket():
-    url = f"wss://fstream.binance.com/ws/{SYMBOL_LOWER}@kline_1m"
-    def on_message(ws, msg):
-        js = json.loads(msg)
-        if js['k']['x']: process_candle(float(js['k']['c']))
-    def on_error(ws, err): print(f"WS Error: {err}")
-    def on_close(ws, c, m): 
-        print("WS Closed. Reconnecting...")
-        time.sleep(5)
-        start_socket()
-    
-    ws = websocket.WebSocketApp(url, on_message=on_message, on_error=on_error, on_close=on_close)
-    ws.run_forever()
-
-threading.Thread(target=start_socket, daemon=True).start()
+# Фоновый поток
+threading.Thread(target=scan_logic, daemon=True).start()
 
 @app.route('/')
-def idx():
-    try:
-        current_ip = requests.get('https://api.ipify.org').text
-        start = time.time()
-        client.futures_ping()
-        latency = (time.time() - start) * 1000
-        return f"<h1>Snake V6.2.1</h1><p>IP: {current_ip}</p><p>Ping: {latency:.2f} ms</p>"
-    except Exception as e:
-        return f"Error: {e}"
+def dashboard():
+    html = """
+    <html>
+    <head>
+        <title>Albion Beast Mode</title>
+        <meta http-equiv="refresh" content="60">
+        <style>
+            body { background: #121212; color: #e0e0e0; font-family: sans-serif; padding: 20px; }
+            table { width: 100%; border-collapse: collapse; margin-top: 20px; }
+            th, td { padding: 12px; border: 1px solid #333; text-align: left; }
+            th { background: #1f1f1f; }
+            tr:nth-child(even) { background: #1a1a1a; }
+            .profit { color: #4caf50; font-weight: bold; }
+        </style>
+    </head>
+    <body>
+        <h1>🏴‍☠️ Albion Caerleon Beast Mode</h1>
+        <p>Найдено активных сделок: <b>{{ deals|length }}</b></p>
+        <table>
+            <tr><th>Предмет</th><th>Качество</th><th>Рынок (Купить)</th><th>ЧР (Продать)</th><th>ЧИСТЫЙ ПРОФИТ</th></tr>
+            {% for d in deals %}
+            <tr>
+                <td>{{ d.name }}</td><td>{{ d.q }}</td><td>{{ d.buy:, }}</td><td>{{ d.sell:, }}</td>
+                <td class="profit">+ {{ d.profit:, }} silver</td>
+            </tr>
+            {% endfor %}
+        </table>
+    </body>
+    </html>
+    """
+    return render_template_string(html, deals=current_deals)
 
-if __name__ == "__main__":
-    port = int(os.environ.get("PORT", 10000))
+if __name__ == '__main__':
+    # Render передает порт через переменную окружения
+    port = int(os.environ.get("PORT", 5000))
     app.run(host='0.0.0.0', port=port)
