@@ -1,5 +1,2 @@
 flask
-python-binance
 requests
-websocket-client
-pandas
