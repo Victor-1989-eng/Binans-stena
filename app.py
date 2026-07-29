@@ -50,7 +50,7 @@ def get_aggregated_orderbook():
     if not bids_raw or not asks_raw:
         return None, None, None
 
-    # Текущая цена — это первый (лучший) бид в стакане
+    # Текущая цена — это цена первого (лучшего) бида в стакане
     current_price = float(bids_raw[0][0])
 
     # Агрегатор для Продавцов (Asks) -> Округление вверх до целого доллара
@@ -66,8 +66,8 @@ def get_aggregated_orderbook():
         aggregated_bids[agg_price] = aggregated_bids.get(agg_price, 0.0) + float(vol)
 
     # Сортируем: аски по возрастанию цены, биды по убыванию цены
-    sorted_asks = sorted([[k, v] for k, v in aggregated_asks.items()], key=lambda x: x[0])
-    sorted_bids = sorted([[k, v] for k, v in aggregated_bids.items()], key=lambda x: x[0], reverse=True)
+    sorted_asks = sorted([[k, v] for k, v in aggregated_asks.items()], key=lambda x: x)
+    sorted_bids = sorted([[k, v] for k, v in aggregated_bids.items()], key=lambda x: x, reverse=True)
 
     return current_price, sorted_asks, sorted_bids
 
