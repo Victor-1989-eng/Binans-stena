@@ -22,7 +22,6 @@ SYMBOL = "SOL/USDC"   # Торгуемая пара
 LEVERAGE = 38         # Имитируемое плечо для расчета прибыли
 
 # Глобальные переменные для отслеживания виртуальной позиции
-# Статусы: None, "LONG_OPENED", "SHORT_OPENED"
 active_trade = None  
 
 def send_telegram(message):
@@ -38,14 +37,13 @@ def get_aggregated_orderbook():
     """Получение стакана Binance и жесткая агрегация строго по $1"""
     exchange = ccxt.binance({'enableRateLimit': True})
     try:
-        # Берем глубокий стакан, чтобы после округления до $1 у нас остались объемы
         orderbook = exchange.fetch_order_book(SYMBOL, limit=500)
     except Exception as e:
         print(f"Ошибка получения стакана: {e}")
         return None, None, None
 
-    bids_raw = orderbook['bids']  # Покупатели [[цена, объем], ...]
-    asks_raw = orderbook['asks']  # Продавцы [[цена, объем], ...]
+    bids_raw = orderbook['bids']  
+    asks_raw = orderbook['asks']  
 
     if not bids_raw or not asks_raw:
         return None, None, None
@@ -55,13 +53,13 @@ def get_aggregated_orderbook():
     # Агрегатор для Продавцов (Asks) -> Округление вверх до целого доллара
     aggregated_asks = {}
     for price, vol in asks_raw:
-        agg_price = int(price) + 1  # Округляем до верхней целой плиты (например, 73.25 -> 74)
+        agg_price = int(price) + 1  
         aggregated_asks[agg_price] = aggregated_asks.get(agg_price, 0.0) + float(vol)
 
     # Агрегатор для Покупателей (Bids) -> Округление вниз до целого доллара
     aggregated_bids = {}
     for price, vol in bids_raw:
-        agg_price = int(price)  # Округляем до нижней целой плиты (например, 72.80 -> 72)
+        agg_price = int(price)  
         aggregated_bids[agg_price] = aggregated_bids.get(agg_price, 0.0) + float(vol)
 
     # Сортируем: аски по возрастанию цены, биды по убыванию цены
@@ -84,41 +82,33 @@ def bot_loop():
 
             # 1. СОПРОВОЖДЕНИЕ ОТКРЫТОЙ В УМЕ СДЕЛКИ
             if active_trade:
-                # Проверка для ЛОНГ позиции
                 if active_trade['side'] == 'LONG':
-                    # Проверяем Стоп-Лосс
                     if current_price <= active_trade['stop_loss']:
                         loss_pct = ((active_trade['stop_loss'] - active_trade['entry_price']) / active_trade['entry_price']) * 100 * LEVERAGE
                         send_telegram(f"💀 *Стоп-Лосс по ЛОНГУ на бумаге!*\nПозиция принудительно закрыта на {current_price}.\nУбыток с плечом {LEVERAGE}х: `{loss_pct:.2f}%`")
                         active_trade = None
 
-                    # Проверяем Тейк-Профит 1
                     elif not active_trade['tp1_triggered'] and current_price >= active_trade['take_profit_1']:
                         active_trade['tp1_triggered'] = True
                         profit_pct = ((active_trade['take_profit_1'] - active_trade['entry_price']) / active_trade['entry_price']) * 100 * LEVERAGE
                         send_telegram(f"💰 *Тейк-Профит 1 (Лонг) выполнен!*\nЗакрыто 50% позиции на {active_trade['take_profit_1']}.\nПрофит части: `+{profit_pct:.2f}%` \nОстаток зафиксируется на {active_trade['take_profit_2']}")
 
-                    # Проверяем Тейк-Профит 2
                     elif active_trade['tp1_triggered'] and current_price >= active_trade['take_profit_2']:
                         profit_pct = ((active_trade['take_profit_2'] - active_trade['entry_price']) / active_trade['entry_price']) * 100 * LEVERAGE
                         send_telegram(f"🟢 *Тейк-Профит 2 (Лонг) выполнен!*\nПозиция полностью закрыта на {active_trade['take_profit_2']}.\nПрофит второй части: `+{profit_pct:.2f}%` 🎉")
                         active_trade = None
 
-                # Проверка для ШОРТ позиции
                 elif active_trade['side'] == 'SHORT':
-                    # Проверяем Стоп-Лосс
                     if current_price >= active_trade['stop_loss']:
                         loss_pct = ((active_trade['entry_price'] - active_trade['stop_loss']) / active_trade['entry_price']) * 100 * LEVERAGE
                         send_telegram(f"💀 *Стоп-Лосс по ШОРТУ на бумаге!*\nПозиция принудительно закрыта на {current_price}.\nУбыток с плечом {LEVERAGE}х: `{loss_pct:.2f}%`")
                         active_trade = None
 
-                    # Проверяем Тейк-Профит 1
                     elif not active_trade['tp1_triggered'] and current_price <= active_trade['take_profit_1']:
                         active_trade['tp1_triggered'] = True
                         profit_pct = ((active_trade['entry_price'] - active_trade['take_profit_1']) / active_trade['entry_price']) * 100 * LEVERAGE
                         send_telegram(f"💰 *Тейк-Профит 1 (Шорт) выполнен!*\nЗакрыто 50% позиции на {active_trade['take_profit_1']}.\nПрофит части: `+{profit_pct:.2f}%` \nОстаток зафиксируется на {active_trade['take_profit_2']}")
 
-                    # Проверяем Тейк-Профит 2
                     elif active_trade['tp1_triggered'] and current_price <= active_trade['take_profit_2']:
                         profit_pct = ((active_trade['entry_price'] - active_trade['take_profit_2']) / active_trade['entry_price']) * 100 * LEVERAGE
                         send_telegram(f"🟢 *Тейк-Профит 2 (Шорт) выполнен!*\nПозиция полностью закрыта на {active_trade['take_profit_2']}.\nПрофит второй части: `+{profit_pct:.2f}%` 🎉")
@@ -128,15 +118,14 @@ def bot_loop():
                 continue
 
             # 2. АНАЛИЗ СТАКАНА НА ВХОД (РАБОТАЕТ В ОБЕ СТОРОНЫ)
-            # Считаем средний объем целых уровней для вычисления аномальных стен
             all_volumes = [v for p, v in asks[:5]] + [v for p, v in bids[:5]]
-            avg_volume = sum(all_volumes) / len(all_volumes)
-            wall_threshold = avg_volume * 3.5  # Стеной считаем превышение среднего объема в 3.5 раза
+            avg_volume = sum(all_volumes) / len(all_volumes) if all_volumes else 1
+            wall_threshold = avg_volume * 3.5  
 
-            # ПРОВЕРКА НА ЛОНГ (Ищем крупные плиты у Продавцов сверху)
+            # ПРОВЕРКА НА ЛОНГ
             for wall_price, volume in asks[:3]:
                 if volume > wall_threshold and (wall_price - current_price) <= 1.5:
-                    entry = wall_price + 0.10  # Вход чуть выше пробитой целой стены
+                    entry = wall_price + 0.10  
                     active_trade = {
                         "side": "LONG",
                         "entry_price": entry,
@@ -162,10 +151,10 @@ def bot_loop():
                 time.sleep(3)
                 continue
 
-            # ПРОВЕРКА НА ШОРТ (Ищем крупные плиты у Покупателей снизу)
+            # ПРОВЕРКА НА ШОРТ
             for wall_price, volume in bids[:3]:
                 if volume > wall_threshold and (current_price - wall_price) <= 1.5:
-                    entry = wall_price - 0.10  # Вход чуть ниже пробитой целой стены поддержки
+                    entry = wall_price - 0.10  
                     active_trade = {
                         "side": "SHORT",
                         "entry_price": entry,
@@ -190,3 +179,14 @@ def bot_loop():
         except Exception as e:
             print(f"Ошибка в основном цикле бота: {e}")
             
+        time.sleep(3) 
+
+# Запуск фонового потока для анализа биржи
+threading.Thread(target=bot_loop, daemon=True).start()
+
+# Точка входа для запуска на Render и локально
+if __name__ == "__main__":
+    # Render автоматически передает номер порта в переменную окружения PORT
+    port = int(os.environ.get("PORT", 5000))
+    # Слушаем все интерфейсы (0.0.0.0), чтобы Render мог достучаться до веб-сервера
+    app.run(host="0.0.0.0", port=port)
