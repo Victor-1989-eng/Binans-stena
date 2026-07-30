@@ -2,4 +2,4 @@ ccxt
 pandas
 requests
 flask
-gunicorn
+websockets
