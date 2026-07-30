@@ -56,9 +56,14 @@ def send_telegram(message: str):
         "parse_mode": "HTML"
     }
     try:
-        requests.post(url, json=payload, timeout=5)
+        res = requests.post(url, json=payload, timeout=5)
+        data = res.json()
+        if not data.get("ok"):
+            print(f"❌ Ошибка Telegram API: {data.get('description')} (код {res.status_code})")
+        else:
+            print("✅ Сообщение в Telegram успешно доставлено!")
     except Exception as e:
-        print(f"Ошибка отправки Telegram: {e}")
+        print(f"Ошибка сети Telegram: {e}")
 
 # --- STATE MANAGEMENT ---
 def load_state():
