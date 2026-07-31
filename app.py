@@ -114,7 +114,7 @@ async def start_orderbook_ws():
         f"⚡ <b>Wall Breakout Bot (Проедание Стен) Запущен!</b>\n"
         f"Пара: {SYMBOL} | Группировка: $1.0\n"
         f"Детектор стены: <b>≥ ${INITIAL_WALL_THRESHOLD_USD:,.0f}</b>\n"
-        f"Триггер входа: <b>< ${EATEN_WALL_THRESHOLD_USD:,.0f}</b>\n"
+        f"Триггер входа: <b>менее ${EATEN_WALL_THRESHOLD_USD:,.0f}</b>\n"
         f"Баланс: ${state['balance']:.2f}"
     )
 
