@@ -27,7 +27,7 @@ STOP_LOSS_OFFSET = 0.25                 # Фиксированный стоп-л
 
 # Настройки безубытка (Break-Even)
 BREAKEVEN_TRIGGER_USD = 0.40   # На сколько $ цена должна пройти в плюс
-BREAKEVEN_OFFSET_USD = 0.02    # Запас поверх точки входа (покрывает комиссии)
+BREAKEVEN_OFFSET_USD = 0.08    # +$0.08 перекрывает Taker-комиссии ($0.20) с запасом
 
 # Биржевые комиссии Binance Futures (Taker 0.05%, Maker 0.02%)
 MAKER_FEE = 0.0002
@@ -121,9 +121,6 @@ def aggregate_orderbook(bids, asks, step=1.0):
 
     return grouped_bids, grouped_asks
 
-# =====================================================================
-# --- ВСПОМОГАТЕЛЬНАЯ ФУНКЦИЯ ДЛЯ КРАСИВОГО СТАТУСА ПРИ ЗАКРЫТИИ ---
-# =====================================================================
 def format_pnl_str(pnl: float) -> str:
     if pnl >= 0:
         return f"+${pnl:.2f}"
@@ -136,13 +133,12 @@ def format_pnl_str(pnl: float) -> str:
 async def start_orderbook_ws():
     state = load_state()
 
-    # Приветствие с экранированием HTML символов
     send_telegram(
-        f"⚡ <b>Wall Breakout Bot (Проедание Стен) Запущен!</b>\n"
+        f"⚡ <b>Wall Breakout Bot v2.1 Запущен!</b>\n"
         f"Пара: {SYMBOL} | Группировка: $1.0\n"
         f"Детектор стены: <b>≥ ${INITIAL_WALL_THRESHOLD_USD:,.0f}</b>\n"
         f"Триггер входа: <b>менее ${EATEN_WALL_THRESHOLD_USD:,.0f}</b>\n"
-        f"Тейк: <b>+$0.85</b> | Стоп: <b>-$0.25</b> | БУ: <b>+$0.40</b>\n"
+        f"Тейк: <b>+$0.85</b> | Стоп: <b>-$0.25</b> | БУ: <b>+$0.40 (+0.08)</b>\n"
         f"Баланс: ${state['balance']:.2f}"
     )
 
@@ -191,9 +187,8 @@ async def start_orderbook_ws():
                         tp = pos['tp']
                         pos_type = pos['type']
 
-                        # --- ЛОГИКА ДЛЯ LONG ---
+                        # --- LONG ---
                         if pos_type == 'LONG':
-                            # А) Перевод в Безубыток (При пробитии +$0.40)
                             if not pos.get('is_breakeven', False) and current_price >= (entry + BREAKEVEN_TRIGGER_USD):
                                 new_sl = entry + BREAKEVEN_OFFSET_USD
                                 pos['sl'] = new_sl
@@ -205,7 +200,6 @@ async def start_orderbook_ws():
                                     f"Новый стоп-лосс: <b>${new_sl:.2f}</b> (Вход: ${entry:.2f})"
                                 )
 
-                            # Б) Закрытие по Тейк-Профиту (Maker)
                             elif current_price >= tp:
                                 exit_p = tp
                                 gross_pnl = (POSITION_SIZE_USD / entry) * (exit_p - entry)
@@ -221,11 +215,10 @@ async def start_orderbook_ws():
                                 send_telegram(
                                     f"🎯 <b>LONG ЗАКРЫТ ПО ТЕЙК-ПРОФИТУ!</b>\n"
                                     f"Вход: ${entry:.2f} ➔ Выход: ${exit_p:.2f}\n"
-                                    f"Профит: <b>+{format_pnl_str(net_pnl)}</b>\n"
+                                    f"Профит: <b>{format_pnl_str(net_pnl)}</b>\n"
                                     f"Баланс: <b>${state['balance']:.2f}</b>"
                                 )
 
-                            # В) Закрытие по Стоп-Лоссу (Taker)
                             elif current_price <= sl:
                                 exit_p = sl
                                 gross_pnl = (POSITION_SIZE_USD / entry) * (exit_p - entry)
@@ -239,7 +232,7 @@ async def start_orderbook_ws():
                                     msg_title = "🛡️ <b>LONG ЗАКРЫТ В БЕЗУБЫТОК</b>"
                                 else:
                                     state['losses'] += 1
-                                    state['cooldown_until'] = time.time() + 300  # Пауза 5 минут
+                                    state['cooldown_until'] = time.time() + 300
                                     msg_title = "🛑 <b>LONG ЗАКРЫТ ПО СТОП-ЛОССУ (Ложный пробой)</b>"
 
                                 state['position'] = None
@@ -252,9 +245,8 @@ async def start_orderbook_ws():
                                     f"Баланс: <b>${state['balance']:.2f}</b>"
                                 )
 
-                        # --- ЛОГИКА ДЛЯ SHORT ---
+                        # --- SHORT ---
                         elif pos_type == 'SHORT':
-                            # А) Перевод в Безубыток (При пробитии +$0.40 вниз)
                             if not pos.get('is_breakeven', False) and current_price <= (entry - BREAKEVEN_TRIGGER_USD):
                                 new_sl = entry - BREAKEVEN_OFFSET_USD
                                 pos['sl'] = new_sl
@@ -266,7 +258,6 @@ async def start_orderbook_ws():
                                     f"Новый стоп-лосс: <b>${new_sl:.2f}</b> (Вход: ${entry:.2f})"
                                 )
 
-                            # Б) Закрытие по Тейк-Профиту (Maker)
                             elif current_price <= tp:
                                 exit_p = tp
                                 gross_pnl = (POSITION_SIZE_USD / entry) * (entry - exit_p)
@@ -282,11 +273,10 @@ async def start_orderbook_ws():
                                 send_telegram(
                                     f"🎯 <b>SHORT ЗАКРЫТ ПО ТЕЙК-ПРОФИТУ!</b>\n"
                                     f"Вход: ${entry:.2f} ➔ Выход: ${exit_p:.2f}\n"
-                                    f"Профит: <b>+{format_pnl_str(net_pnl)}</b>\n"
+                                    f"Профит: <b>{format_pnl_str(net_pnl)}</b>\n"
                                     f"Баланс: <b>${state['balance']:.2f}</b>"
                                 )
 
-                            # В) Закрытие по Стоп-Лоссу (Taker)
                             elif current_price >= sl:
                                 exit_p = sl
                                 gross_pnl = (POSITION_SIZE_USD / entry) * (entry - exit_p)
@@ -300,7 +290,7 @@ async def start_orderbook_ws():
                                     msg_title = "🛡️ <b>SHORT ЗАКРЫТ В БЕЗУБЫТОК</b>"
                                 else:
                                     state['losses'] += 1
-                                    state['cooldown_until'] = time.time() + 300  # Пауза 5 минут
+                                    state['cooldown_until'] = time.time() + 300
                                     msg_title = "🛑 <b>SHORT ЗАКРЫТ ПО СТОП-ЛОССУ (Ложный пробой)</b>"
 
                                 state['position'] = None
@@ -314,7 +304,7 @@ async def start_orderbook_ws():
                                 )
 
                     # -------------------------------------------------
-                    # 2. ПОИСК ТОЧЕК ВХОДА (ПРОЕДАНИЕ СТЕН)
+                    # 2. ПОИСК ТОЧЕК ВХОДА (ИСПРАВЛЕННАЯ ЛОГИКА)
                     # -------------------------------------------------
                     else:
                         if time.time() < state.get('cooldown_until', 0):
@@ -322,76 +312,79 @@ async def start_orderbook_ws():
 
                         # А) ПРОВЕРКА ПРОЕДАНИЯ СТЕНЫ ПРОДАВЦОВ (ASKS) ➔ ВХОД В LONG
                         for wall_lvl, peak_vol in list(tracked_ask_walls.items()):
-                            if (wall_lvl - 0.50) <= current_price <= (wall_lvl + 0.30):
-                                current_vol = g_asks.get(wall_lvl, 0.0)
+                            # Цена должна быть ВПЛОТНУЮ к стене (от -0.15$ до +0.10$)
+                            if (wall_lvl - 0.15) <= current_price <= (wall_lvl + 0.10):
+                                # СТЕНА ОБЯЗАНА ПРИСУТСТВОВАТЬ В ТЕКУЩЕМ СТАКАНЕ
+                                if wall_lvl in g_asks:
+                                    current_vol = g_asks[wall_lvl]
 
-                                if current_vol < EATEN_WALL_THRESHOLD_USD:
-                                    entry_p = current_price
-                                    sl_p = entry_p - STOP_LOSS_OFFSET    # Стоп: Вход - $0.25
-                                    tp_p = entry_p + TAKE_PROFIT_USD     # Тейк: Вход + $0.85
+                                    if current_vol < EATEN_WALL_THRESHOLD_USD:
+                                        entry_p = current_price
+                                        sl_p = entry_p - STOP_LOSS_OFFSET
+                                        tp_p = entry_p + TAKE_PROFIT_USD
 
-                                    state['position'] = {
-                                        'type': 'LONG',
-                                        'entry': entry_p,
-                                        'sl': sl_p,
-                                        'tp': tp_p,
-                                        'wall_price': wall_lvl,
-                                        'is_breakeven': False
-                                    }
-                                    save_state(state)
-                                    del tracked_ask_walls[wall_lvl]
+                                        state['position'] = {
+                                            'type': 'LONG',
+                                            'entry': entry_p,
+                                            'sl': sl_p,
+                                            'tp': tp_p,
+                                            'wall_price': wall_lvl,
+                                            'is_breakeven': False
+                                        }
+                                        save_state(state)
+                                        del tracked_ask_walls[wall_lvl]
 
-                                    send_telegram(
-                                        f"🚀 <b>ПРОЕДАНИЕ СТЕНЫ! ВХОД В LONG</b>\n"
-                                        f"🔥 Пробита стена: <b>${wall_lvl:.0f}</b> (Пик: ${peak_vol/1e6:.2f}M ➔ Ост: ${current_vol/1e3:.0f}k)\n"
-                                        f"Вход по маркету: <b>${entry_p:.2f}</b>\n"
-                                        f"Тейк-профит: ${tp_p:.2f} | Стоп-лосс: ${sl_p:.2f}"
-                                    )
-                                    break
+                                        send_telegram(
+                                            f"🚀 <b>ПРОЕДАНИЕ СТЕНЫ! ВХОД В LONG</b>\n"
+                                            f"🔥 Пробита стена: <b>${wall_lvl:.0f}</b> (Пик: ${peak_vol/1e6:.2f}M ➔ Ост: ${current_vol/1e3:.0f}k)\n"
+                                            f"Вход по маркету: <b>${entry_p:.2f}</b>\n"
+                                            f"Тейк-профит: ${tp_p:.2f} | Стоп-лосс: ${sl_p:.2f}"
+                                        )
+                                        break
 
                         if state['position'] is not None:
                             continue
 
                         # Б) ПРОВЕРКА ПРОЕДАНИЯ СТЕНЫ ПОКУПАТЕЛЕЙ (BIDS) ➔ ВХОД В SHORT
                         for wall_lvl, peak_vol in list(tracked_bid_walls.items()):
-                            if (wall_lvl - 0.30) <= current_price <= (wall_lvl + 1.50):
-                                current_vol = g_bids.get(wall_lvl, 0.0)
+                            # Цена должна быть ВПЛОТНУЮ к стене (от -0.10$ до +0.15$)
+                            if (wall_lvl - 0.10) <= current_price <= (wall_lvl + 0.15):
+                                if wall_lvl in g_bids:
+                                    current_vol = g_bids[wall_lvl]
 
-                                if current_vol < EATEN_WALL_THRESHOLD_USD:
-                                    entry_p = current_price
-                                    sl_p = entry_p + STOP_LOSS_OFFSET    # Стоп: Вход + $0.25
-                                    tp_p = entry_p - TAKE_PROFIT_USD     # Тейк: Вход - $0.85
+                                    if current_vol < EATEN_WALL_THRESHOLD_USD:
+                                        entry_p = current_price
+                                        sl_p = entry_p + STOP_LOSS_OFFSET
+                                        tp_p = entry_p - TAKE_PROFIT_USD
 
-                                    state['position'] = {
-                                        'type': 'SHORT',
-                                        'entry': entry_p,
-                                        'sl': sl_p,
-                                        'tp': tp_p,
-                                        'wall_price': wall_lvl,
-                                        'is_breakeven': False
-                                    }
-                                    save_state(state)
-                                    del tracked_bid_walls[wall_lvl]
+                                        state['position'] = {
+                                            'type': 'SHORT',
+                                            'entry': entry_p,
+                                            'sl': sl_p,
+                                            'tp': tp_p,
+                                            'wall_price': wall_lvl,
+                                            'is_breakeven': False
+                                        }
+                                        save_state(state)
+                                        del tracked_bid_walls[wall_lvl]
 
-                                    send_telegram(
-                                        f"📉 <b>ПРОЕДАНИЕ СТЕНЫ! ВХОД В SHORT</b>\n"
-                                        f"🔥 Пробита стена: <b>${wall_lvl:.0f}</b> (Пик: ${peak_vol/1e6:.2f}M ➔ Ост: ${current_vol/1e3:.0f}k)\n"
-                                        f"Вход по маркету: <b>${entry_p:.2f}</b>\n"
-                                        f"Тейк-профит: ${tp_p:.2f} | Стоп-лосс: ${sl_p:.2f}"
-                                    )
-                                    break
+                                        send_telegram(
+                                            f"📉 <b>ПРОЕДАНИЕ СТЕНЫ! ВХОД В SHORT</b>\n"
+                                            f"🔥 Пробита стена: <b>${wall_lvl:.0f}</b> (Пик: ${peak_vol/1e6:.2f}M ➔ Ост: ${current_vol/1e3:.0f}k)\n"
+                                            f"Вход по маркету: <b>${entry_p:.2f}</b>\n"
+                                            f"Тейк-профит: ${tp_p:.2f} | Стоп-лосс: ${sl_p:.2f}"
+                                        )
+                                        break
 
         except Exception as e:
             print(f"⚠️ Ошибка соединения стакана: {e}. Переподключение через 5 сек...")
             await asyncio.sleep(5)
 
 # =====================================================================
-# --- ТОЧКА ВХОДА В ПРИЛОЖЕНИЕ ---
+# --- ТОЧКА ВХОДА ---
 # =====================================================================
 if __name__ == "__main__":
-    # Запуск Flask сервера в отдельном потоке для Render
     flask_thread = threading.Thread(target=run_flask, daemon=True)
     flask_thread.start()
 
-    # Запуск WebSocket сканера стакана
     asyncio.run(start_orderbook_ws())
