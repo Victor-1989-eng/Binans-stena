@@ -22,16 +22,16 @@ INITIAL_WALL_THRESHOLD_USD = 1_500_000  # Детект стены от $1.5M
 EATEN_WALL_THRESHOLD_USD = 200_000      # Сигнал на вход, когда осталось < $200k
 
 # Риск-менеджмент
-TAKE_PROFIT_USD = 0.85                  # Тейк-профит (+$0.85 от входа)
+TAKE_PROFIT_USD = 0.50                  # Тейк-профит (+$0.85 от входа)
 STOP_LOSS_OFFSET = 0.25                 # Фиксированный стоп-лосс ($0.25)
 
 # Настройки безубытка (Break-Even)
-BREAKEVEN_TRIGGER_USD = 0.40   # На сколько $ цена должна пройти в плюс
+BREAKEVEN_TRIGGER_USD = 0.30   # На сколько $ цена должна пройти в плюс
 BREAKEVEN_OFFSET_USD = 0.08    # +$0.08 перекрывает Taker-комиссии ($0.20) с запасом
 
 # Биржевые комиссии Binance Futures (Taker 0.05%, Maker 0.02%)
 MAKER_FEE = 0.0002
-TAKER_FEE = 0.0005
+TAKER_FEE = 0.0003
 
 # Телеграм и хранилище
 TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "")
