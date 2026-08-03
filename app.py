@@ -21,8 +21,8 @@ POSITION_SIZE_USD = MARGIN_PER_TRADE * LEVERAGE  # $200 в рынке
 ORDERBOOK_AGG_STEP = 0.1                # Шаг группировки уровней (0.1, 0.5, 1.0, 2.0)
 
 # 2. Пороги определения и проедания стен
-INITIAL_WALL_THRESHOLD_USD = 1_500_000  # Детект стены от $1.5M
-EATEN_WALL_THRESHOLD_USD = 200_000      # Сигнал на вход, когда осталось менее $200k
+INITIAL_WALL_THRESHOLD_USD = 800_000  # Детект стены от $1.5M
+EATEN_WALL_THRESHOLD_USD = 100_000      # Сигнал на вход, когда осталось менее $200k
 
 # 3. Фильтр "Тонкого стакана за стеной"
 THIN_BOOK_CHECK_LEVELS = 3              # Сколько уровней ЗА стеной проверяем
