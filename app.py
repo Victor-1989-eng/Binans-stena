@@ -22,7 +22,7 @@ ORDERBOOK_AGG_STEP = 0.1                # Шаг группировки уров
 
 # 2. Пороги определения и проедания стен
 INITIAL_WALL_THRESHOLD_USD = 1_500_000  # Детект стены от $1.5M
-EATEN_WALL_THRESHOLD_USD = 200_000      # Сигнал на вход, когда осталось < $200k
+EATEN_WALL_THRESHOLD_USD = 200_000      # Сигнал на вход, когда осталось менее $200k
 
 # 3. Фильтр "Тонкого стакана за стеной"
 THIN_BOOK_CHECK_LEVELS = 3              # Сколько уровней ЗА стеной проверяем
@@ -120,7 +120,7 @@ def aggregate_orderbook(bids, asks, step=1.0):
     for p_str, q_str in bids:
         price = float(p_str)
         qty = float(q_str)
-        # Округляем до 4 знаков для избежания багов float
+        # Безопасное округление до 4 знаков для избежания багов float
         level = round(math.floor(price / step) * step, 4)
         grouped_bids[level] = grouped_bids.get(level, 0.0) + (price * qty)
 
@@ -135,7 +135,7 @@ def aggregate_orderbook(bids, asks, step=1.0):
 def is_book_thin_behind(grouped_book, wall_lvl, direction, step, num_levels, max_vol):
     """
     Проверяет, тонкий ли стакан ЗА пробиваемой стеной.
-    Возвращает (True, None, 0), если стакан пуст/тонок.
+    Возвращает (True, None, 0), если стакан чист.
     Возвращает (False, blocked_lvl, vol), если встречен плотный уровень.
     """
     for i in range(1, num_levels + 1):
@@ -163,11 +163,11 @@ async def start_orderbook_ws():
     state = load_state()
 
     send_telegram(
-        f"⚡ <b>Wall Breakout Bot v2.4 (с проверкой глубины) Запущен!</b>\n"
+        f"⚡ <b>Wall Breakout Bot v2.5 (Fixed HTML) Запущен!</b>\n"
         f"Пара: {SYMBOL} | Шаг агрегации: <b>${ORDERBOOK_AGG_STEP}</b>\n"
         f"Детект стены: <b>≥ ${INITIAL_WALL_THRESHOLD_USD:,.0f}</b>\n"
-        f"Триггер проедания: <b>< ${EATEN_WALL_THRESHOLD_USD:,.0f}</b>\n"
-        f"Фильтр глубины: <b>{THIN_BOOK_CHECK_LEVELS} уровней < ${MAX_BEHIND_WALL_VOL_USD:,.0f}</b>\n"
+        f"Триггер проедания: <b>менее ${EATEN_WALL_THRESHOLD_USD:,.0f}</b>\n"
+        f"Фильтр глубины: <b>{THIN_BOOK_CHECK_LEVELS} уровней до ${MAX_BEHIND_WALL_VOL_USD:,.0f}</b>\n"
         f"Тейк: <b>+$0.50</b> | Стоп: <b>-$0.25</b> | БУ: <b>+$0.30 (+0.08)</b>\n"
         f"Баланс: ${state['balance']:.2f}"
     )
@@ -197,7 +197,7 @@ async def start_orderbook_ws():
                     best_ask = float(asks[0][0])
                     current_price = (best_bid + best_ask) / 2.0
 
-                    # Агрегация с шагом и безопасным округлением
+                    # Агрегация с безопасным округлением
                     g_bids, g_asks = aggregate_orderbook(bids, asks, step=ORDERBOOK_AGG_STEP)
 
                     # Обновление реестра крупных стен
@@ -374,7 +374,7 @@ async def start_orderbook_ws():
                                     send_telegram(
                                         f"🚀 <b>ПРОЕДАНИЕ СТЕНЫ! ВХОД В LONG</b>\n"
                                         f"🔥 Пробита стена: <b>${wall_lvl:.2f}</b> (Пик: ${peak_vol/1e6:.2f}M ➔ Ост: ${current_vol/1e3:.0f}k)\n"
-                                        f"📊 Проверка стакана: <b>Уровни за стеной чисты (<${MAX_BEHIND_WALL_VOL_USD/1e3:.0f}k)</b>\n"
+                                        f"📊 Стакан за стеной: <b>Чист (до ${MAX_BEHIND_WALL_VOL_USD/1e3:.0f}k)</b>\n"
                                         f"Вход по маркету: <b>${entry_p:.2f}</b>\n"
                                         f"Тейк-профит: ${tp_p:.2f} | Стоп-лосс: ${sl_p:.2f}"
                                     )
@@ -421,7 +421,7 @@ async def start_orderbook_ws():
                                     send_telegram(
                                         f"📉 <b>ПРОЕДАНИЕ СТЕНЫ! ВХОД В SHORT</b>\n"
                                         f"🔥 Пробита стена: <b>${wall_lvl:.2f}</b> (Пик: ${peak_vol/1e6:.2f}M ➔ Ост: ${current_vol/1e3:.0f}k)\n"
-                                        f"📊 Проверка стакана: <b>Уровни за стеной чисты (<${MAX_BEHIND_WALL_VOL_USD/1e3:.0f}k)</b>\n"
+                                        f"📊 Стакан за стеной: <b>Чист (до ${MAX_BEHIND_WALL_VOL_USD/1e3:.0f}k)</b>\n"
                                         f"Вход по маркету: <b>${entry_p:.2f}</b>\n"
                                         f"Тейк-профит: ${tp_p:.2f} | Стоп-лосс: ${sl_p:.2f}"
                                     )
