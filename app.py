@@ -10,7 +10,7 @@ import websockets
 from flask import Flask
 
 # =====================================================================
-# --- FLASK WEB SERVER (ДЛЯ РЕНДЕРА / HEALTH CHECK) ---
+# --- FLASK WEB SERVER (ДЛЯ RENDER / HEALTH CHECK) ---
 # =====================================================================
 app = Flask(__name__)
 
@@ -29,11 +29,11 @@ def run_flask():
 SYMBOL = 'SOL/USDC'
 ORDERBOOK_AGG_STEP = 0.1
 
-TRACK_MIN_WALL_USD = 300_000            # Ловим все стены от $300k
+TRACK_MIN_WALL_USD = 300_000            # Ловим стены от $300k
 EATEN_TRIGGER_USD = 80_000              # Триггер проедания (< $80k)
 
 THIN_BOOK_CHECK_LEVELS = 3              # Проверяем 3 уровня ($0.30) за стеной
-TRACK_DURATION_SEC = 60                 # Время наблюдения за импульсом цены
+TRACK_DURATION_SEC = 360                 # Время наблюдения за импульсом цены
 
 TEST_DURATION_HOURS = 24                # Длительность сбора данных (3 дня)
 CSV_FILE = "wall_stats.csv"
@@ -212,18 +212,19 @@ async def start_analytics():
     start_time = time.time()
     end_time = start_time + (TEST_DURATION_HOURS * 3600)
 
+    # Оповещение только о старте теста (с датой получения итогового отчета)
     send_telegram(
-        f"🚀 <b>Запущен 3-дневный сбор статистики!</b>\n"
+        f"🚀 <b>Запущен 3-дневный бесшумный сбор статистики!</b>\n"
         f"Пара: {SYMBOL} | Шаг: <b>${ORDERBOOK_AGG_STEP}</b>\n"
-        f"Отслеживаем стены от: <b>${TRACK_MIN_WALL_USD:,.0f}</b>\n"
-        f"Время завершения: <b>{time.strftime('%Y-%m-%d %H:%M', time.localtime(end_time))}</b>"
+        f"Сбор данных выполняется тихо в CSV без уведомлений по отдельным стенам.\n"
+        f"Итоговый отчет с настройками придет: <b>{time.strftime('%Y-%m-%d %H:%M', time.localtime(end_time))}</b>"
     )
 
     while time.time() < end_time:
         try:
             print(f"🔌 Подключение к WebSocket стакана: {ws_url}")
             async with websockets.connect(ws_url, ping_interval=20, ping_timeout=20) as ws:
-                print("✅ WebSocket подключен. Идет сбор данных...")
+                print("✅ WebSocket подключен. Идет тихий сбор данных в CSV...")
 
                 async for message in ws:
                     if time.time() >= end_time:
@@ -265,14 +266,7 @@ async def start_analytics():
                                 }
                                 active_monitors.append(event)
                                 del tracked_ask_walls[wall_lvl]
-
-                                send_telegram(
-                                    f"🔍 <b>[ДЕТЕКТ ПРОБОЯ LONG]</b>\n"
-                                    f"Стена: <b>${wall_lvl:.2f}</b> (${peak_vol/1e3:.0f}k)\n"
-                                    f"Остаток: <b>менее ${curr_vol/1e3:.0f}k</b>\n"
-                                    f"Макс. за стеной: <b>${max_behind/1e3:.0f}k</b>\n"
-                                    f"Вход: ${current_price:.2f} | ⏳ Мониторинг 60с..."
-                                )
+                                print(f"🔍 [LONG ДЕТЕКТ] Стена ${wall_lvl:.2f} — записано в локальный мониторинг")
 
                     # 3. Проедание BID (SHORT)
                     for wall_lvl, peak_vol in list(tracked_bid_walls.items()):
@@ -290,16 +284,9 @@ async def start_analytics():
                                 }
                                 active_monitors.append(event)
                                 del tracked_bid_walls[wall_lvl]
+                                print(f"🔍 [SHORT ДЕТЕКТ] Стена ${wall_lvl:.2f} — записано в локальный мониторинг")
 
-                                send_telegram(
-                                    f"🔍 <b>[ДЕТЕКТ ПРОБОЯ SHORT]</b>\n"
-                                    f"Стена: <b>${wall_lvl:.2f}</b> (${peak_vol/1e3:.0f}k)\n"
-                                    f"Остаток: <b>менее ${curr_vol/1e3:.0f}k</b>\n"
-                                    f"Макс. за стеной: <b>${max_behind/1e3:.0f}k</b>\n"
-                                    f"Вход: ${current_price:.2f} | ⏳ Мониторинг 60с..."
-                                )
-
-                    # 4. Обновление максимумов/минимумов и отправка отчета через 60с
+                    # 4. Обновление максимумов/минимумов и запись в CSV (без вызовов Telegram)
                     for m in list(active_monitors):
                         m["max_price"] = max(m["max_price"], current_price)
                         m["min_price"] = min(m["min_price"], current_price)
@@ -309,50 +296,31 @@ async def start_analytics():
                             impulse = (m["max_price"] - entry) if m["direction"] == "LONG" else (entry - m["min_price"])
                             drawdown = (entry - m["min_price"]) if m["direction"] == "LONG" else (m["max_price"] - entry)
 
-                            hit_tp_050 = impulse >= 0.50
-                            hit_sl_025 = drawdown >= 0.25
-
                             log_data = {
                                 "timestamp": time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(m["start_time"])),
                                 "direction": m["direction"], "wall_price": m["wall_price"],
                                 "initial_wall_usd": m["initial_wall_usd"], "eaten_wall_usd": m["eaten_wall_usd"],
                                 "max_behind_vol_usd": m["max_behind_vol_usd"], "entry_price": entry,
                                 "max_impulse_usd": impulse, "max_drawdown_usd": drawdown,
-                                "hit_tp_050": "YES" if hit_tp_050 else "NO",
-                                "hit_sl_025": "YES" if hit_sl_025 else "NO"
+                                "hit_tp_050": "YES" if impulse >= 0.50 else "NO",
+                                "hit_sl_025": "YES" if drawdown >= 0.25 else "NO"
                             }
                             log_event_to_csv(log_data)
-
-                            tp_icon = "🎯 TP ДОСТИГНУТ (+0.50)" if hit_tp_050 else "❌ TP НЕ ДОСТИГНУТ"
-                            sl_icon = "🛑 БЫЛ СТОП (-0.25)" if hit_sl_025 else "✅ Без выбивания стопа"
-
-                            send_telegram(
-                                f"📈 <b>[ОТЧЕТ 60с ПО СТЕНЕ ${m['wall_price']:.2f}] {m['direction']}</b>\n"
-                                f"Объем стены: <b>${m['initial_wall_usd']/1e3:.0f}k</b>\n"
-                                f"За стеной было: <b>${m['max_behind_vol_usd']/1e3:.0f}k</b>\n"
-                                f"───────────────────\n"
-                                f"🚀 Макс. Импульс: <b>+${impulse:.2f}</b>\n"
-                                f"📉 Макс. Просадка: <b>-${drawdown:.2f}</b>\n"
-                                f"Статус TP (+0.50): {tp_icon}\n"
-                                f"Статус SL (-0.25): {sl_icon}"
-                            )
-
+                            print(f"✅ [CSV LOG] Стена ${m['wall_price']:.2f} ({m['direction']}): Импульс +${impulse:.2f}, Просадка -${drawdown:.2f}")
                             active_monitors.remove(m)
 
         except Exception as e:
             print(f"⚠️ Ошибка WebSocket: {e}. Переподключение через 5 секунд...")
             await asyncio.sleep(5)
 
-    # Генерация итогового оптимизационного отчета ровно через 3 дня
+    # Генерация итогового отчета в Telegram ровно через 3 дня
     generate_optimal_config_report()
 
 # =====================================================================
 # --- ТОЧКА ВХОДА ---
 # =====================================================================
 if __name__ == "__main__":
-    # Запуск Flask сервера в фоновом потоке для Render Health Check
     flask_thread = threading.Thread(target=run_flask, daemon=True)
     flask_thread.start()
 
-    # Запуск основного асинхронного цикла сбора данных
     asyncio.run(start_analytics())
