@@ -1,66 +1,29 @@
-import os
-import math
-import json
 import asyncio
-import threading
-import requests
+import json
+import math
+import os
 import time
+import csv
+import requests
 import websockets
-from flask import Flask
 
 # =====================================================================
-# --- НАСТРОЙКИ ТОРГОВОГО АЛГОРИТМА ---
+# --- НАСТРОЙКИ ТЕСТА ---
 # =====================================================================
 SYMBOL = 'SOL/USDC'
-INITIAL_BALANCE = 100.0
-LEVERAGE = 20
-MARGIN_PER_TRADE = 10.0
-POSITION_SIZE_USD = MARGIN_PER_TRADE * LEVERAGE  # $200 в рынке
+ORDERBOOK_AGG_STEP = 0.1
 
-# 1. Настройки агрегации стакана
-ORDERBOOK_AGG_STEP = 0.1                # Шаг группировки уровней (0.1, 0.5, 1.0, 2.0)
+TRACK_MIN_WALL_USD = 300_000            # Фиксируем стены от $300k
+EATEN_TRIGGER_USD = 80_000              # Триггер проедания (< $80k)
 
-# 2. Пороги определения и проедания стен
-INITIAL_WALL_THRESHOLD_USD = 800_000  # Детект стены от $1.5M
-EATEN_WALL_THRESHOLD_USD = 100_000      # Сигнал на вход, когда осталось менее $200k
+THIN_BOOK_CHECK_LEVELS = 3              # Проверка уровней за стеной
+TRACK_DURATION_SEC = 60                 # Следим 60 секунд за импульсом
 
-# 3. Фильтр "Тонкого стакана за стеной"
-THIN_BOOK_CHECK_LEVELS = 3              # Сколько уровней ЗА стеной проверяем
-MAX_BEHIND_WALL_VOL_USD = 500_000       # Макс. объем на любом из уровней за стеной
+TEST_DURATION_HOURS = 24                # Длительность теста (3 дня)
+CSV_FILE = "wall_stats.csv"
 
-# 4. Риск-менеджмент
-TAKE_PROFIT_USD = 0.50                  # Тейк-профит (+$0.50 от входа)
-STOP_LOSS_OFFSET = 0.25                 # Фиксированный стоп-лосс ($0.25)
-
-# 5. Настройки безубытка (Break-Even)
-BREAKEVEN_TRIGGER_USD = 0.30            # Переводим в БУ при движении на +$0.30
-BREAKEVEN_OFFSET_USD = 0.08             # +$0.08 перекрывает Taker-комиссии ($0.20)
-
-# 6. Кулдаун отработанного уровня (в секундах)
-LEVEL_COOLDOWN_SEC = 900                # 15 минут заморозки уровня после входа
-
-# 7. Комиссии Binance Futures (Taker 0.05%, Maker 0.02%)
-MAKER_FEE = 0.0002
-TAKER_FEE = 0.0003
-
-# 8. Телеграм и хранилище
 TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "")
 TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "")
-STATE_FILE = "paper_state.json"
-
-# =====================================================================
-# --- FLASK WEB SERVER ---
-# =====================================================================
-app = Flask(__name__)
-
-@app.route('/')
-@app.route('/health')
-def health_check():
-    return "Wall Eating Scalper Bot is Running!", 200
-
-def run_flask():
-    port = int(os.environ.get("PORT", 8080))
-    app.run(host="0.0.0.0", port=port)
 
 # =====================================================================
 # --- TELEGRAM NOTIFIER ---
@@ -81,361 +44,252 @@ def send_telegram(message: str):
         if not data.get("ok"):
             print(f"❌ Telegram Error: {data.get('description')}")
     except Exception as e:
-        print(f"Ошибка отправки сообщения в Telegram: {e}")
+        print(f"Ошибка отправки в Telegram: {e}")
 
 # =====================================================================
-# --- STATE MANAGEMENT ---
+# --- ХРАНИЛИЩЕ И CSV ---
 # =====================================================================
-def load_state():
-    if os.path.exists(STATE_FILE):
-        try:
-            with open(STATE_FILE, "r", encoding="utf-8") as f:
-                return json.load(f)
-        except Exception:
-            pass
-    return {
-        "balance": INITIAL_BALANCE,
-        "position": None,
-        "cooldown_until": 0,
-        "total_trades": 0,
-        "wins": 0,
-        "losses": 0,
-        "total_fees": 0.0
-    }
+def init_csv():
+    if not os.path.exists(CSV_FILE):
+        with open(CSV_FILE, mode='w', newline='', encoding='utf-8') as f:
+            writer = csv.writer(f)
+            writer.writerow([
+                "timestamp", "direction", "wall_price", "initial_wall_usd", 
+                "eaten_wall_usd", "max_behind_vol_usd", "entry_price",
+                "max_impulse_usd", "max_drawdown_usd", 
+                "hit_tp_050", "hit_sl_025"
+            ])
 
-def save_state(state):
-    try:
-        with open(STATE_FILE, "w", encoding="utf-8") as f:
-            json.dump(state, f, ensure_ascii=False, indent=2)
-    except Exception as e:
-        print(f"Ошибка сохранения состояния: {e}")
+def log_event_to_csv(data):
+    with open(CSV_FILE, mode='a', newline='', encoding='utf-8') as f:
+        writer = csv.writer(f)
+        writer.writerow([
+            data["timestamp"], data["direction"], data["wall_price"],
+            round(data["initial_wall_usd"]), round(data["eaten_wall_usd"]),
+            round(data["max_behind_vol_usd"]), data["entry_price"],
+            round(data["max_impulse_usd"], 2), round(data["max_drawdown_usd"], 2),
+            data["hit_tp_050"], data["hit_sl_025"]
+        ])
 
-# =====================================================================
-# --- АГРЕГАЦИЯ И ПРОВЕРКА СТАКАНОМ ---
-# =====================================================================
-def aggregate_orderbook(bids, asks, step=1.0):
-    grouped_bids = {}
-    grouped_asks = {}
-
+def aggregate_orderbook(bids, asks, step=0.1):
+    grouped_bids, grouped_asks = {}, {}
     for p_str, q_str in bids:
-        price = float(p_str)
-        qty = float(q_str)
-        # Безопасное округление до 4 знаков для избежания багов float
+        price, qty = float(p_str), float(q_str)
         level = round(math.floor(price / step) * step, 4)
         grouped_bids[level] = grouped_bids.get(level, 0.0) + (price * qty)
 
     for p_str, q_str in asks:
-        price = float(p_str)
-        qty = float(q_str)
+        price, qty = float(p_str), float(q_str)
         level = round(math.floor(price / step) * step, 4)
         grouped_asks[level] = grouped_asks.get(level, 0.0) + (price * qty)
 
     return grouped_bids, grouped_asks
 
-def is_book_thin_behind(grouped_book, wall_lvl, direction, step, num_levels, max_vol):
-    """
-    Проверяет, тонкий ли стакан ЗА пробиваемой стеной.
-    Возвращает (True, None, 0), если стакан чист.
-    Возвращает (False, blocked_lvl, vol), если встречен плотный уровень.
-    """
+def get_max_behind_vol(grouped_book, wall_lvl, direction, step, num_levels):
+    max_vol = 0.0
     for i in range(1, num_levels + 1):
-        if direction == 'LONG':
-            check_lvl = round(wall_lvl + (i * step), 4)
-        else:
-            check_lvl = round(wall_lvl - (i * step), 4)
-
+        check_lvl = round(wall_lvl + (i * step), 4) if direction == 'LONG' else round(wall_lvl - (i * step), 4)
         vol = grouped_book.get(check_lvl, 0.0)
         if vol > max_vol:
-            return False, check_lvl, vol
-
-    return True, None, 0.0
-
-def format_pnl_str(pnl: float) -> str:
-    if pnl >= 0:
-        return f"+${pnl:.2f}"
-    else:
-        return f"-${abs(pnl):.2f}"
+            max_vol = vol
+    return max_vol
 
 # =====================================================================
-# --- ОСНОВНОЙ ЛУП WEBSOCKET БОТА ---
+# --- МОДУЛЬ АНАЛИЗА И ПОДБОРА ЛУЧШИХ ПАРАМЕТРОВ ---
 # =====================================================================
-async def start_orderbook_ws():
-    state = load_state()
+def generate_optimal_config_report():
+    if not os.path.exists(CSV_FILE):
+        send_telegram("⚠️ Нет данных в CSV для формирования итогового отчета.")
+        return
 
-    send_telegram(
-        f"⚡ <b>Wall Breakout Bot v2.5 (Fixed HTML) Запущен!</b>\n"
-        f"Пара: {SYMBOL} | Шаг агрегации: <b>${ORDERBOOK_AGG_STEP}</b>\n"
-        f"Детект стены: <b>≥ ${INITIAL_WALL_THRESHOLD_USD:,.0f}</b>\n"
-        f"Триггер проедания: <b>менее ${EATEN_WALL_THRESHOLD_USD:,.0f}</b>\n"
-        f"Фильтр глубины: <b>{THIN_BOOK_CHECK_LEVELS} уровней до ${MAX_BEHIND_WALL_VOL_USD:,.0f}</b>\n"
-        f"Тейк: <b>+$0.50</b> | Стоп: <b>-$0.25</b> | БУ: <b>+$0.30 (+0.08)</b>\n"
-        f"Баланс: ${state['balance']:.2f}"
+    rows = []
+    with open(CSV_FILE, mode='r', encoding='utf-8') as f:
+        reader = csv.DictReader(f)
+        for r in reader:
+            rows.append({
+                "initial_wall": float(r["initial_wall_usd"]),
+                "max_behind": float(r["max_behind_vol_usd"]),
+                "impulse": float(r["max_impulse_usd"]),
+                "drawdown": float(r["max_drawdown_usd"]),
+            })
+
+    total_events = len(rows)
+    if total_events == 0:
+        send_telegram("⚠️ За 3 дня не зафиксировано ни одного пробоя стен.")
+        return
+
+    # Сетка перебора параметров
+    wall_candidates = [300_000, 400_000, 500_000, 600_000, 700_000, 800_000, 1_000_000]
+    behind_candidates = [150_000, 250_000, 350_000, 500_000, 1_000_000]
+
+    best_score = -99999
+    best_config = None
+    best_stats = {}
+
+    for w_min in wall_candidates:
+        for b_max in behind_candidates:
+            trades = 0
+            wins = 0
+            losses = 0
+
+            for r in rows:
+                # Применяем фильтр
+                if r["initial_wall"] >= w_min and r["max_behind"] <= b_max:
+                    trades += 1
+                    # Если просадка раньше или одновременно перекрыла стоп
+                    if r["drawdown"] >= 0.25:
+                        losses += 1
+                    elif r["impulse"] >= 0.50:
+                        wins += 1
+
+            if trades >= 5:  # Релевантный выбор (минимум 5 сделок)
+                win_rate = (wins / trades) * 100
+                # Финансовый профит: +$0.50 за вин, -$0.25 за лосс
+                pnl = (wins * 0.50) - (losses * 0.25)
+
+                if pnl > best_score:
+                    best_score = pnl
+                    best_config = (w_min, b_max)
+                    best_stats = {
+                        "trades": trades,
+                        "wins": wins,
+                        "losses": losses,
+                        "win_rate": win_rate,
+                        "pnl": pnl
+                    }
+
+    if not best_config:
+        send_telegram("⚠️ Не удалось подобрать прибыльную комбинацию (мало данных).")
+        return
+
+    opt_wall, opt_behind = best_config
+
+    report_msg = (
+        f"🏆 <b>ИТОГОВЫЙ ОТЧЕТ ЗА 3 ДНЯ ТЕСТА</b>\n"
+        f"Проанализировано пробоев: <b>{total_events}</b>\n"
+        f"─────────────────────────────\n"
+        f"🥇 <b>Лучшие найденные параметры:</b>\n"
+        f"• Всего сделок по фильтру: <b>{best_stats['trades']}</b>\n"
+        f"• Побед (TP +$0.50): <b>{best_stats['wins']}</b>\n"
+        f"• Поражений (SL -$0.25): <b>{best_stats['losses']}</b>\n"
+        f"• Win Rate: <b>{best_stats['win_rate']:.1f}%</b>\n"
+        f"• Чистый PnL с 1 лота: <b>+${best_stats['pnl']:.2f}</b>\n\n"
+        f"📋 <b>ГОТОВЫЙ КОД ДЛЯ app.py:</b>\n"
+        f"<pre>"
+        f"ORDERBOOK_AGG_STEP = 0.1\n"
+        f"INITIAL_WALL_THRESHOLD_USD = {opt_wall}\n"
+        f"EATEN_WALL_THRESHOLD_USD = {EATEN_TRIGGER_USD}\n"
+        f"THIN_BOOK_CHECK_LEVELS = 3\n"
+        f"MAX_BEHIND_WALL_VOL_USD = {opt_behind}"
+        f"</pre>\n\n"
+        f"Вставьте эти значения в ваш основной бот paper-торговли!"
     )
+    send_telegram(report_msg)
 
+# =====================================================================
+# --- ЦИКЛ МОНИТОРИНГА ---
+# =====================================================================
+async def start_analytics():
+    init_csv()
     ws_symbol = SYMBOL.replace('/', '').lower()
     ws_url = f"wss://fstream.binance.com/ws/{ws_symbol}@depth20@100ms"
 
     tracked_ask_walls = {}
     tracked_bid_walls = {}
-    level_cooldowns = {}
+    active_monitors = []
 
-    while True:
+    start_time = time.time()
+    end_time = start_time + (TEST_DURATION_HOURS * 3600)
+
+    send_telegram(
+        f"🚀 <b>Запущен 3-дневный сбор статистики!</b>\n"
+        f"Пара: {SYMBOL} | Шаг: <b>${ORDERBOOK_AGG_STEP}</b>\n"
+        f"Завершение и итоговый отчет: <b>{time.strftime('%Y-%m-%d %H:%M', time.localtime(end_time))}</b>"
+    )
+
+    while time.time() < end_time:
         try:
-            print(f"🔌 Подключение к WebSocket стакана Futures: {ws_url}")
             async with websockets.connect(ws_url, ping_interval=20, ping_timeout=20) as ws:
-                print("✅ Стакан подключен! Мониторим проедание стен и глубину...")
-
                 async for message in ws:
-                    data = json.loads(message)
-                    bids = data.get('b', [])
-                    asks = data.get('a', [])
+                    if time.time() >= end_time:
+                        break
 
+                    data = json.loads(message)
+                    bids, asks = data.get('b', []), data.get('a', [])
                     if not bids or not asks:
                         continue
 
-                    best_bid = float(bids[0][0])
-                    best_ask = float(asks[0][0])
+                    best_bid, best_ask = float(bids[0][0]), float(asks[0][0])
                     current_price = (best_bid + best_ask) / 2.0
+                    now = time.time()
 
-                    # Агрегация с безопасным округлением
                     g_bids, g_asks = aggregate_orderbook(bids, asks, step=ORDERBOOK_AGG_STEP)
 
-                    # Обновление реестра крупных стен
                     for lvl, vol in g_asks.items():
-                        if vol >= INITIAL_WALL_THRESHOLD_USD:
+                        if vol >= TRACK_MIN_WALL_USD:
                             tracked_ask_walls[lvl] = max(tracked_ask_walls.get(lvl, 0), vol)
 
                     for lvl, vol in g_bids.items():
-                        if vol >= INITIAL_WALL_THRESHOLD_USD:
+                        if vol >= TRACK_MIN_WALL_USD:
                             tracked_bid_walls[lvl] = max(tracked_bid_walls.get(lvl, 0), vol)
 
-                    # 1. СОПРОВОЖДЕНИЕ ПОЗИЦИИ
-                    if state['position'] is not None:
-                        pos = state['position']
-                        entry = pos['entry']
-                        sl = pos['sl']
-                        tp = pos['tp']
-                        pos_type = pos['type']
+                    # LONG
+                    for wall_lvl, peak_vol in list(tracked_ask_walls.items()):
+                        if (wall_lvl - 0.15) <= current_price <= (wall_lvl + 0.10):
+                            curr_vol = g_asks.get(wall_lvl, 0.0)
+                            if curr_vol < EATEN_TRIGGER_USD:
+                                max_behind = get_max_behind_vol(g_asks, wall_lvl, 'LONG', ORDERBOOK_AGG_STEP, THIN_BOOK_CHECK_LEVELS)
+                                active_monitors.append({
+                                    "direction": "LONG", "wall_price": wall_lvl,
+                                    "initial_wall_usd": peak_vol, "eaten_wall_usd": curr_vol,
+                                    "max_behind_vol_usd": max_behind, "entry_price": current_price,
+                                    "start_time": now, "expire_time": now + TRACK_DURATION_SEC,
+                                    "max_price": current_price, "min_price": current_price
+                                })
+                                del tracked_ask_walls[wall_lvl]
 
-                        if pos_type == 'LONG':
-                            if not pos.get('is_breakeven', False) and current_price >= (entry + BREAKEVEN_TRIGGER_USD):
-                                new_sl = entry + BREAKEVEN_OFFSET_USD
-                                pos['sl'] = new_sl
-                                pos['is_breakeven'] = True
-                                save_state(state)
-                                send_telegram(
-                                    f"🛡️ <b>LONG ПЕРЕВЕДЕН В БЕЗУБЫТОК!</b>\n"
-                                    f"Текущая цена: ${current_price:.2f}\n"
-                                    f"Новый стоп-лосс: <b>${new_sl:.2f}</b> (Вход: ${entry:.2f})"
-                                )
+                    # SHORT
+                    for wall_lvl, peak_vol in list(tracked_bid_walls.items()):
+                        if (wall_lvl - 0.10) <= current_price <= (wall_lvl + 0.15):
+                            curr_vol = g_bids.get(wall_lvl, 0.0)
+                            if curr_vol < EATEN_TRIGGER_USD:
+                                max_behind = get_max_behind_vol(g_bids, wall_lvl, 'SHORT', ORDERBOOK_AGG_STEP, THIN_BOOK_CHECK_LEVELS)
+                                active_monitors.append({
+                                    "direction": "SHORT", "wall_price": wall_lvl,
+                                    "initial_wall_usd": peak_vol, "eaten_wall_usd": curr_vol,
+                                    "max_behind_vol_usd": max_behind, "entry_price": current_price,
+                                    "start_time": now, "expire_time": now + TRACK_DURATION_SEC,
+                                    "max_price": current_price, "min_price": current_price
+                                })
+                                del tracked_bid_walls[wall_lvl]
 
-                            elif current_price >= tp:
-                                exit_p = tp
-                                gross_pnl = (POSITION_SIZE_USD / entry) * (exit_p - entry)
-                                fee = (POSITION_SIZE_USD * TAKER_FEE) + (POSITION_SIZE_USD * MAKER_FEE)
-                                net_pnl = gross_pnl - fee
+                    # Фиксация и сохранение
+                    for m in list(active_monitors):
+                        m["max_price"] = max(m["max_price"], current_price)
+                        m["min_price"] = min(m["min_price"], current_price)
 
-                                state['balance'] += net_pnl
-                                state['wins'] += 1
-                                state['total_trades'] += 1
-                                state['position'] = None
-                                save_state(state)
+                        if now >= m["expire_time"]:
+                            entry = m["entry_price"]
+                            impulse = (m["max_price"] - entry) if m["direction"] == "LONG" else (entry - m["min_price"])
+                            drawdown = (entry - m["min_price"]) if m["direction"] == "LONG" else (m["max_price"] - entry)
 
-                                send_telegram(
-                                    f"🎯 <b>LONG ЗАКРЫТ ПО ТЕЙК-ПРОФИТУ!</b>\n"
-                                    f"Вход: ${entry:.2f} ➔ Выход: ${exit_p:.2f}\n"
-                                    f"Профит: <b>{format_pnl_str(net_pnl)}</b>\n"
-                                    f"Баланс: <b>${state['balance']:.2f}</b>"
-                                )
-
-                            elif current_price <= sl:
-                                exit_p = sl
-                                gross_pnl = (POSITION_SIZE_USD / entry) * (exit_p - entry)
-                                fee = (POSITION_SIZE_USD * TAKER_FEE) * 2
-                                net_pnl = gross_pnl - fee
-
-                                state['balance'] += net_pnl
-                                state['total_trades'] += 1
-
-                                if pos.get('is_breakeven', False):
-                                    msg_title = "🛡️ <b>LONG ЗАКРЫТ В БЕЗУБЫТОК</b>"
-                                else:
-                                    state['losses'] += 1
-                                    state['cooldown_until'] = time.time() + 300
-                                    msg_title = "🛑 <b>LONG ЗАКРЫТ ПО СТОП-ЛОССУ (Ложный пробой)</b>"
-
-                                state['position'] = None
-                                save_state(state)
-
-                                send_telegram(
-                                    f"{msg_title}\n"
-                                    f"Вход: ${entry:.2f} ➔ Выход: ${exit_p:.2f}\n"
-                                    f"Итог: <b>{format_pnl_str(net_pnl)}</b>\n"
-                                    f"Баланс: <b>${state['balance']:.2f}</b>"
-                                )
-
-                        elif pos_type == 'SHORT':
-                            if not pos.get('is_breakeven', False) and current_price <= (entry - BREAKEVEN_TRIGGER_USD):
-                                new_sl = entry - BREAKEVEN_OFFSET_USD
-                                pos['sl'] = new_sl
-                                pos['is_breakeven'] = True
-                                save_state(state)
-                                send_telegram(
-                                    f"🛡️ <b>SHORT ПЕРЕВЕДЕН В БЕЗУБЫТОК!</b>\n"
-                                    f"Текущая цена: ${current_price:.2f}\n"
-                                    f"Новый стоп-лосс: <b>${new_sl:.2f}</b> (Вход: ${entry:.2f})"
-                                )
-
-                            elif current_price <= tp:
-                                exit_p = tp
-                                gross_pnl = (POSITION_SIZE_USD / entry) * (entry - exit_p)
-                                fee = (POSITION_SIZE_USD * TAKER_FEE) + (POSITION_SIZE_USD * MAKER_FEE)
-                                net_pnl = gross_pnl - fee
-
-                                state['balance'] += net_pnl
-                                state['wins'] += 1
-                                state['total_trades'] += 1
-                                state['position'] = None
-                                save_state(state)
-
-                                send_telegram(
-                                    f"🎯 <b>SHORT ЗАКРЫТ ПО ТЕЙК-ПРОФИТУ!</b>\n"
-                                    f"Вход: ${entry:.2f} ➔ Выход: ${exit_p:.2f}\n"
-                                    f"Профит: <b>{format_pnl_str(net_pnl)}</b>\n"
-                                    f"Баланс: <b>${state['balance']:.2f}</b>"
-                                )
-
-                            elif current_price >= sl:
-                                exit_p = sl
-                                gross_pnl = (POSITION_SIZE_USD / entry) * (entry - exit_p)
-                                fee = (POSITION_SIZE_USD * TAKER_FEE) * 2
-                                net_pnl = gross_pnl - fee
-
-                                state['balance'] += net_pnl
-                                state['total_trades'] += 1
-
-                                if pos.get('is_breakeven', False):
-                                    msg_title = "🛡️ <b>SHORT ЗАКРЫТ В БЕЗУБЫТОК</b>"
-                                else:
-                                    state['losses'] += 1
-                                    state['cooldown_until'] = time.time() + 300
-                                    msg_title = "🛑 <b>SHORT ЗАКРЫТ ПО СТОП-ЛОССУ (Ложный пробой)</b>"
-
-                                state['position'] = None
-                                save_state(state)
-
-                                send_telegram(
-                                    f"{msg_title}\n"
-                                    f"Вход: ${entry:.2f} ➔ Выход: ${exit_p:.2f}\n"
-                                    f"Итог: <b>{format_pnl_str(net_pnl)}</b>\n"
-                                    f"Баланс: <b>${state['balance']:.2f}</b>"
-                                )
-
-                    # 2. ПОИСК ТОЧЕК ВХОДА С ПРОВЕРКОЙ СТАКАНА
-                    else:
-                        if time.time() < state.get('cooldown_until', 0):
-                            continue
-
-                        # А) LONG
-                        for wall_lvl, peak_vol in list(tracked_ask_walls.items()):
-                            if time.time() < level_cooldowns.get(wall_lvl, 0):
-                                continue
-
-                            if (wall_lvl - 0.15) <= current_price <= (wall_lvl + 0.10):
-                                current_vol = g_asks.get(wall_lvl, 0.0)
-
-                                if current_vol < EATEN_WALL_THRESHOLD_USD:
-                                    # ПРОВЕРКА: Тонкий ли стакан ЗА стеной?
-                                    is_thin, block_lvl, block_vol = is_book_thin_behind(
-                                        g_asks, wall_lvl, 'LONG', ORDERBOOK_AGG_STEP,
-                                        THIN_BOOK_CHECK_LEVELS, MAX_BEHIND_WALL_VOL_USD
-                                    )
-
-                                    if not is_thin:
-                                        print(f"⚠️ Пропуск LONG у ${wall_lvl}: уровень ${block_lvl} перекрыт объемом ${block_vol/1e3:.0f}k")
-                                        continue
-
-                                    entry_p = current_price
-                                    sl_p = entry_p - STOP_LOSS_OFFSET
-                                    tp_p = entry_p + TAKE_PROFIT_USD
-
-                                    state['position'] = {
-                                        'type': 'LONG',
-                                        'entry': entry_p,
-                                        'sl': sl_p,
-                                        'tp': tp_p,
-                                        'wall_price': wall_lvl,
-                                        'is_breakeven': False
-                                    }
-                                    level_cooldowns[wall_lvl] = time.time() + LEVEL_COOLDOWN_SEC
-                                    save_state(state)
-                                    del tracked_ask_walls[wall_lvl]
-
-                                    send_telegram(
-                                        f"🚀 <b>ПРОЕДАНИЕ СТЕНЫ! ВХОД В LONG</b>\n"
-                                        f"🔥 Пробита стена: <b>${wall_lvl:.2f}</b> (Пик: ${peak_vol/1e6:.2f}M ➔ Ост: ${current_vol/1e3:.0f}k)\n"
-                                        f"📊 Стакан за стеной: <b>Чист (до ${MAX_BEHIND_WALL_VOL_USD/1e3:.0f}k)</b>\n"
-                                        f"Вход по маркету: <b>${entry_p:.2f}</b>\n"
-                                        f"Тейк-профит: ${tp_p:.2f} | Стоп-лосс: ${sl_p:.2f}"
-                                    )
-                                    break
-
-                        if state['position'] is not None:
-                            continue
-
-                        # Б) SHORT
-                        for wall_lvl, peak_vol in list(tracked_bid_walls.items()):
-                            if time.time() < level_cooldowns.get(wall_lvl, 0):
-                                continue
-
-                            if (wall_lvl - 0.10) <= current_price <= (wall_lvl + 0.15):
-                                current_vol = g_bids.get(wall_lvl, 0.0)
-
-                                if current_vol < EATEN_WALL_THRESHOLD_USD:
-                                    # ПРОВЕРКА: Тонкий ли стакан ЗА стеной?
-                                    is_thin, block_lvl, block_vol = is_book_thin_behind(
-                                        g_bids, wall_lvl, 'SHORT', ORDERBOOK_AGG_STEP,
-                                        THIN_BOOK_CHECK_LEVELS, MAX_BEHIND_WALL_VOL_USD
-                                    )
-
-                                    if not is_thin:
-                                        print(f"⚠️ Пропуск SHORT у ${wall_lvl}: уровень ${block_lvl} перекрыт объемом ${block_vol/1e3:.0f}k")
-                                        continue
-
-                                    entry_p = current_price
-                                    sl_p = entry_p + STOP_LOSS_OFFSET
-                                    tp_p = entry_p - TAKE_PROFIT_USD
-
-                                    state['position'] = {
-                                        'type': 'SHORT',
-                                        'entry': entry_p,
-                                        'sl': sl_p,
-                                        'tp': tp_p,
-                                        'wall_price': wall_lvl,
-                                        'is_breakeven': False
-                                    }
-                                    level_cooldowns[wall_lvl] = time.time() + LEVEL_COOLDOWN_SEC
-                                    save_state(state)
-                                    del tracked_bid_walls[wall_lvl]
-
-                                    send_telegram(
-                                        f"📉 <b>ПРОЕДАНИЕ СТЕНЫ! ВХОД В SHORT</b>\n"
-                                        f"🔥 Пробита стена: <b>${wall_lvl:.2f}</b> (Пик: ${peak_vol/1e6:.2f}M ➔ Ост: ${current_vol/1e3:.0f}k)\n"
-                                        f"📊 Стакан за стеной: <b>Чист (до ${MAX_BEHIND_WALL_VOL_USD/1e3:.0f}k)</b>\n"
-                                        f"Вход по маркету: <b>${entry_p:.2f}</b>\n"
-                                        f"Тейк-профит: ${tp_p:.2f} | Стоп-лосс: ${sl_p:.2f}"
-                                    )
-                                    break
+                            log_data = {
+                                "timestamp": time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(m["start_time"])),
+                                "direction": m["direction"], "wall_price": m["wall_price"],
+                                "initial_wall_usd": m["initial_wall_usd"], "eaten_wall_usd": m["eaten_wall_usd"],
+                                "max_behind_vol_usd": m["max_behind_vol_usd"], "entry_price": entry,
+                                "max_impulse_usd": impulse, "max_drawdown_usd": drawdown,
+                                "hit_tp_050": "YES" if impulse >= 0.50 else "NO",
+                                "hit_sl_025": "YES" if drawdown >= 0.25 else "NO"
+                            }
+                            log_event_to_csv(log_data)
+                            active_monitors.remove(m)
 
         except Exception as e:
-            print(f"⚠️ Ошибка соединения стакана: {e}. Переподключение через 5 сек...")
             await asyncio.sleep(5)
 
-# =====================================================================
-# --- ТОЧКА ВХОДА ---
-# =====================================================================
-if __name__ == "__main__":
-    flask_thread = threading.Thread(target=run_flask, daemon=True)
-    flask_thread.start()
+    # ПО ИСТЕЧЕНИИ 3 ДНЕЙ
+    generate_optimal_config_report()
 
-    asyncio.run(start_orderbook_ws())
+if __name__ == "__main__":
+    asyncio.run(start_analytics())
