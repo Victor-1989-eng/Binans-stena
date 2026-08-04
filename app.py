@@ -4,24 +4,41 @@ import math
 import os
 import time
 import csv
+import threading
 import requests
 import websockets
+from flask import Flask
 
 # =====================================================================
-# --- НАСТРОЙКИ ТЕСТА ---
+# --- FLASK WEB SERVER (ДЛЯ РЕНДЕРА / HEALTH CHECK) ---
+# =====================================================================
+app = Flask(__name__)
+
+@app.route('/')
+@app.route('/health')
+def health_check():
+    return "Wall Analytics Worker is Live & Running!", 200
+
+def run_flask():
+    port = int(os.environ.get("PORT", 8080))
+    app.run(host="0.0.0.0", port=port)
+
+# =====================================================================
+# --- НАСТРОЙКИ СБОРА СТАТИСТИКИ ---
 # =====================================================================
 SYMBOL = 'SOL/USDC'
 ORDERBOOK_AGG_STEP = 0.1
 
-TRACK_MIN_WALL_USD = 300_000            # Фиксируем стены от $300k
+TRACK_MIN_WALL_USD = 300_000            # Ловим все стены от $300k
 EATEN_TRIGGER_USD = 80_000              # Триггер проедания (< $80k)
 
-THIN_BOOK_CHECK_LEVELS = 3              # Проверка уровней за стеной
-TRACK_DURATION_SEC = 60                 # Следим 60 секунд за импульсом
+THIN_BOOK_CHECK_LEVELS = 3              # Проверяем 3 уровня ($0.30) за стеной
+TRACK_DURATION_SEC = 60                 # Время наблюдения за импульсом цены
 
-TEST_DURATION_HOURS = 24                # Длительность теста (3 дня)
+TEST_DURATION_HOURS = 24                # Длительность сбора данных (3 дня)
 CSV_FILE = "wall_stats.csv"
 
+# Настройки Telegram
 TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "")
 TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "")
 
@@ -47,7 +64,7 @@ def send_telegram(message: str):
         print(f"Ошибка отправки в Telegram: {e}")
 
 # =====================================================================
-# --- ХРАНИЛИЩЕ И CSV ---
+# --- ХРАНИЛИЩЕ И CSV ЛОГГЕР ---
 # =====================================================================
 def init_csv():
     if not os.path.exists(CSV_FILE):
@@ -95,7 +112,7 @@ def get_max_behind_vol(grouped_book, wall_lvl, direction, step, num_levels):
     return max_vol
 
 # =====================================================================
-# --- МОДУЛЬ АНАЛИЗА И ПОДБОРА ЛУЧШИХ ПАРАМЕТРОВ ---
+# --- МОДУЛЬ ОПТИМИЗАЦИИ И АНАЛИЗА НАСТРОЕК ---
 # =====================================================================
 def generate_optimal_config_report():
     if not os.path.exists(CSV_FILE):
@@ -115,10 +132,9 @@ def generate_optimal_config_report():
 
     total_events = len(rows)
     if total_events == 0:
-        send_telegram("⚠️ За 3 дня не зафиксировано ни одного пробоя стен.")
+        send_telegram("⚠️ За период теста не зафиксировано ни одного пробоя стен.")
         return
 
-    # Сетка перебора параметров
     wall_candidates = [300_000, 400_000, 500_000, 600_000, 700_000, 800_000, 1_000_000]
     behind_candidates = [150_000, 250_000, 350_000, 500_000, 1_000_000]
 
@@ -128,23 +144,18 @@ def generate_optimal_config_report():
 
     for w_min in wall_candidates:
         for b_max in behind_candidates:
-            trades = 0
-            wins = 0
-            losses = 0
+            trades, wins, losses = 0, 0, 0
 
             for r in rows:
-                # Применяем фильтр
                 if r["initial_wall"] >= w_min and r["max_behind"] <= b_max:
                     trades += 1
-                    # Если просадка раньше или одновременно перекрыла стоп
                     if r["drawdown"] >= 0.25:
                         losses += 1
                     elif r["impulse"] >= 0.50:
                         wins += 1
 
-            if trades >= 5:  # Релевантный выбор (минимум 5 сделок)
+            if trades >= 5:
                 win_rate = (wins / trades) * 100
-                # Финансовый профит: +$0.50 за вин, -$0.25 за лосс
                 pnl = (wins * 0.50) - (losses * 0.25)
 
                 if pnl > best_score:
@@ -159,7 +170,7 @@ def generate_optimal_config_report():
                     }
 
     if not best_config:
-        send_telegram("⚠️ Не удалось подобрать прибыльную комбинацию (мало данных).")
+        send_telegram("⚠️ Не удалось подобрать прибыльную комбинацию из-за недостатка репрезентативных данных.")
         return
 
     opt_wall, opt_behind = best_config
@@ -168,7 +179,7 @@ def generate_optimal_config_report():
         f"🏆 <b>ИТОГОВЫЙ ОТЧЕТ ЗА 3 ДНЯ ТЕСТА</b>\n"
         f"Проанализировано пробоев: <b>{total_events}</b>\n"
         f"─────────────────────────────\n"
-        f"🥇 <b>Лучшие найденные параметры:</b>\n"
+        f"🥇 <b>Оптимальные настройки для бумаги:</b>\n"
         f"• Всего сделок по фильтру: <b>{best_stats['trades']}</b>\n"
         f"• Побед (TP +$0.50): <b>{best_stats['wins']}</b>\n"
         f"• Поражений (SL -$0.25): <b>{best_stats['losses']}</b>\n"
@@ -182,12 +193,12 @@ def generate_optimal_config_report():
         f"THIN_BOOK_CHECK_LEVELS = 3\n"
         f"MAX_BEHIND_WALL_VOL_USD = {opt_behind}"
         f"</pre>\n\n"
-        f"Вставьте эти значения в ваш основной бот paper-торговли!"
+        f"Скопируйте эти значения в ваш основной бот paper-торговли!"
     )
     send_telegram(report_msg)
 
 # =====================================================================
-# --- ЦИКЛ МОНИТОРИНГА ---
+# --- ОСНОВНОЙ ЦИКЛ WEBSOCKET МОНИТОРИНГА ---
 # =====================================================================
 async def start_analytics():
     init_csv()
@@ -204,12 +215,16 @@ async def start_analytics():
     send_telegram(
         f"🚀 <b>Запущен 3-дневный сбор статистики!</b>\n"
         f"Пара: {SYMBOL} | Шаг: <b>${ORDERBOOK_AGG_STEP}</b>\n"
-        f"Завершение и итоговый отчет: <b>{time.strftime('%Y-%m-%d %H:%M', time.localtime(end_time))}</b>"
+        f"Отслеживаем стены от: <b>${TRACK_MIN_WALL_USD:,.0f}</b>\n"
+        f"Время завершения: <b>{time.strftime('%Y-%m-%d %H:%M', time.localtime(end_time))}</b>"
     )
 
     while time.time() < end_time:
         try:
+            print(f"🔌 Подключение к WebSocket стакана: {ws_url}")
             async with websockets.connect(ws_url, ping_interval=20, ping_timeout=20) as ws:
+                print("✅ WebSocket подключен. Идет сбор данных...")
+
                 async for message in ws:
                     if time.time() >= end_time:
                         break
@@ -225,6 +240,7 @@ async def start_analytics():
 
                     g_bids, g_asks = aggregate_orderbook(bids, asks, step=ORDERBOOK_AGG_STEP)
 
+                    # 1. Поиск стен
                     for lvl, vol in g_asks.items():
                         if vol >= TRACK_MIN_WALL_USD:
                             tracked_ask_walls[lvl] = max(tracked_ask_walls.get(lvl, 0), vol)
@@ -233,37 +249,57 @@ async def start_analytics():
                         if vol >= TRACK_MIN_WALL_USD:
                             tracked_bid_walls[lvl] = max(tracked_bid_walls.get(lvl, 0), vol)
 
-                    # LONG
+                    # 2. Проедание ASK (LONG)
                     for wall_lvl, peak_vol in list(tracked_ask_walls.items()):
                         if (wall_lvl - 0.15) <= current_price <= (wall_lvl + 0.10):
                             curr_vol = g_asks.get(wall_lvl, 0.0)
                             if curr_vol < EATEN_TRIGGER_USD:
                                 max_behind = get_max_behind_vol(g_asks, wall_lvl, 'LONG', ORDERBOOK_AGG_STEP, THIN_BOOK_CHECK_LEVELS)
-                                active_monitors.append({
+                                
+                                event = {
                                     "direction": "LONG", "wall_price": wall_lvl,
                                     "initial_wall_usd": peak_vol, "eaten_wall_usd": curr_vol,
                                     "max_behind_vol_usd": max_behind, "entry_price": current_price,
                                     "start_time": now, "expire_time": now + TRACK_DURATION_SEC,
                                     "max_price": current_price, "min_price": current_price
-                                })
+                                }
+                                active_monitors.append(event)
                                 del tracked_ask_walls[wall_lvl]
 
-                    # SHORT
+                                send_telegram(
+                                    f"🔍 <b>[ДЕТЕКТ ПРОБОЯ LONG]</b>\n"
+                                    f"Стена: <b>${wall_lvl:.2f}</b> (${peak_vol/1e3:.0f}k)\n"
+                                    f"Остаток: <b>менее ${curr_vol/1e3:.0f}k</b>\n"
+                                    f"Макс. за стеной: <b>${max_behind/1e3:.0f}k</b>\n"
+                                    f"Вход: ${current_price:.2f} | ⏳ Мониторинг 60с..."
+                                )
+
+                    # 3. Проедание BID (SHORT)
                     for wall_lvl, peak_vol in list(tracked_bid_walls.items()):
                         if (wall_lvl - 0.10) <= current_price <= (wall_lvl + 0.15):
                             curr_vol = g_bids.get(wall_lvl, 0.0)
                             if curr_vol < EATEN_TRIGGER_USD:
                                 max_behind = get_max_behind_vol(g_bids, wall_lvl, 'SHORT', ORDERBOOK_AGG_STEP, THIN_BOOK_CHECK_LEVELS)
-                                active_monitors.append({
+
+                                event = {
                                     "direction": "SHORT", "wall_price": wall_lvl,
                                     "initial_wall_usd": peak_vol, "eaten_wall_usd": curr_vol,
                                     "max_behind_vol_usd": max_behind, "entry_price": current_price,
                                     "start_time": now, "expire_time": now + TRACK_DURATION_SEC,
                                     "max_price": current_price, "min_price": current_price
-                                })
+                                }
+                                active_monitors.append(event)
                                 del tracked_bid_walls[wall_lvl]
 
-                    # Фиксация и сохранение
+                                send_telegram(
+                                    f"🔍 <b>[ДЕТЕКТ ПРОБОЯ SHORT]</b>\n"
+                                    f"Стена: <b>${wall_lvl:.2f}</b> (${peak_vol/1e3:.0f}k)\n"
+                                    f"Остаток: <b>менее ${curr_vol/1e3:.0f}k</b>\n"
+                                    f"Макс. за стеной: <b>${max_behind/1e3:.0f}k</b>\n"
+                                    f"Вход: ${current_price:.2f} | ⏳ Мониторинг 60с..."
+                                )
+
+                    # 4. Обновление максимумов/минимумов и отправка отчета через 60с
                     for m in list(active_monitors):
                         m["max_price"] = max(m["max_price"], current_price)
                         m["min_price"] = min(m["min_price"], current_price)
@@ -273,23 +309,50 @@ async def start_analytics():
                             impulse = (m["max_price"] - entry) if m["direction"] == "LONG" else (entry - m["min_price"])
                             drawdown = (entry - m["min_price"]) if m["direction"] == "LONG" else (m["max_price"] - entry)
 
+                            hit_tp_050 = impulse >= 0.50
+                            hit_sl_025 = drawdown >= 0.25
+
                             log_data = {
                                 "timestamp": time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(m["start_time"])),
                                 "direction": m["direction"], "wall_price": m["wall_price"],
                                 "initial_wall_usd": m["initial_wall_usd"], "eaten_wall_usd": m["eaten_wall_usd"],
                                 "max_behind_vol_usd": m["max_behind_vol_usd"], "entry_price": entry,
                                 "max_impulse_usd": impulse, "max_drawdown_usd": drawdown,
-                                "hit_tp_050": "YES" if impulse >= 0.50 else "NO",
-                                "hit_sl_025": "YES" if drawdown >= 0.25 else "NO"
+                                "hit_tp_050": "YES" if hit_tp_050 else "NO",
+                                "hit_sl_025": "YES" if hit_sl_025 else "NO"
                             }
                             log_event_to_csv(log_data)
+
+                            tp_icon = "🎯 TP ДОСТИГНУТ (+0.50)" if hit_tp_050 else "❌ TP НЕ ДОСТИГНУТ"
+                            sl_icon = "🛑 БЫЛ СТОП (-0.25)" if hit_sl_025 else "✅ Без выбивания стопа"
+
+                            send_telegram(
+                                f"📈 <b>[ОТЧЕТ 60с ПО СТЕНЕ ${m['wall_price']:.2f}] {m['direction']}</b>\n"
+                                f"Объем стены: <b>${m['initial_wall_usd']/1e3:.0f}k</b>\n"
+                                f"За стеной было: <b>${m['max_behind_vol_usd']/1e3:.0f}k</b>\n"
+                                f"───────────────────\n"
+                                f"🚀 Макс. Импульс: <b>+${impulse:.2f}</b>\n"
+                                f"📉 Макс. Просадка: <b>-${drawdown:.2f}</b>\n"
+                                f"Статус TP (+0.50): {tp_icon}\n"
+                                f"Статус SL (-0.25): {sl_icon}"
+                            )
+
                             active_monitors.remove(m)
 
         except Exception as e:
+            print(f"⚠️ Ошибка WebSocket: {e}. Переподключение через 5 секунд...")
             await asyncio.sleep(5)
 
-    # ПО ИСТЕЧЕНИИ 3 ДНЕЙ
+    # Генерация итогового оптимизационного отчета ровно через 3 дня
     generate_optimal_config_report()
 
+# =====================================================================
+# --- ТОЧКА ВХОДА ---
+# =====================================================================
 if __name__ == "__main__":
+    # Запуск Flask сервера в фоновом потоке для Render Health Check
+    flask_thread = threading.Thread(target=run_flask, daemon=True)
+    flask_thread.start()
+
+    # Запуск основного асинхронного цикла сбора данных
     asyncio.run(start_analytics())
