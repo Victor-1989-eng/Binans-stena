@@ -21,12 +21,12 @@ POSITION_SIZE_USD = MARGIN_PER_TRADE * LEVERAGE  # $200 в рынке
 ORDERBOOK_AGG_STEP = 0.1                # Шаг группировки уровней (0.1, 0.5, 1.0, 2.0)
 
 # 2. Пороги определения и проедания стен
-INITIAL_WALL_THRESHOLD_USD = 500_000  # Детект стены от $1.5M
-EATEN_WALL_THRESHOLD_USD = 100_000      # Сигнал на вход, когда осталось менее $200k
+INITIAL_WALL_THRESHOLD_USD = 1000_000  # Детект стены от $1.5M
+EATEN_WALL_THRESHOLD_USD = 200_000      # Сигнал на вход, когда осталось менее $200k
 
 # 3. Фильтр "Тонкого стакана за стеной"
 THIN_BOOK_CHECK_LEVELS = 3              # Сколько уровней ЗА стеной проверяем
-MAX_BEHIND_WALL_VOL_USD = 1000_000       # Макс. объем на любом из уровней за стеной
+MAX_BEHIND_WALL_VOL_USD = 500_000       # Макс. объем на любом из уровней за стеной
 
 # 4. Риск-менеджмент
 TAKE_PROFIT_USD = 0.20                  # Тейк-профит (+$0.50 от входа)
@@ -37,7 +37,7 @@ BREAKEVEN_TRIGGER_USD = 0.30            # Переводим в БУ при дв
 BREAKEVEN_OFFSET_USD = 0.08             # +$0.08 перекрывает Taker-комиссии ($0.20)
 
 # 6. Кулдаун отработанного уровня (в секундах)
-LEVEL_COOLDOWN_SEC = 360                # 15 минут заморозки уровня после входа
+LEVEL_COOLDOWN_SEC = 60                # 15 минут заморозки уровня после входа
 
 # 7. Комиссии Binance Futures (Taker 0.05%, Maker 0.02%)
 MAKER_FEE = 0.0002
