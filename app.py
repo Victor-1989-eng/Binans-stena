@@ -17,27 +17,30 @@ LEVERAGE = 20
 MARGIN_PER_TRADE = 10.0
 POSITION_SIZE_USD = MARGIN_PER_TRADE * LEVERAGE  # $200 в рынке
 
+# Направление торговли: 1 = по тренду (обычный пробой стен), -1 = реверс (вход наоборот)
+TRADE_DIRECTION = -1 
+
 # 1. Настройки агрегации стакана
 ORDERBOOK_AGG_STEP = 1.0                # Шаг группировки уровней (0.1, 0.5, 1.0, 2.0)
 
 # 2. Пороги определения и проедания стен
-INITIAL_WALL_THRESHOLD_USD = 2000_000  # Детект стены от $1.5M
-EATEN_WALL_THRESHOLD_USD = 100_000      # Сигнал на вход, когда осталось менее $200k
+INITIAL_WALL_THRESHOLD_USD = 2000_000   # Детект стены от $2.0M
+EATEN_WALL_THRESHOLD_USD = 100_000      # Сигнал на вход, когда осталось менее $100k
 
 # 3. Фильтр "Тонкого стакана за стеной"
 THIN_BOOK_CHECK_LEVELS = 1              # Сколько уровней ЗА стеной проверяем
 MAX_BEHIND_WALL_VOL_USD = 1000_000       # Макс. объем на любом из уровней за стеной
 
 # 4. Риск-менеджмент
-TAKE_PROFIT_USD = 0.20                  # Тейк-профит (+$0.50 от входа)
-STOP_LOSS_OFFSET = 0.10                 # Фиксированный стоп-лосс ($0.25)
+TAKE_PROFIT_USD = 0.10                  # Тейк-профит (+$0.20 от входа)
+STOP_LOSS_OFFSET = 0.10                 # Фиксированный стоп-лосс ($0.10)
 
 # 5. Настройки безубытка (Break-Even)
 BREAKEVEN_TRIGGER_USD = 0.30            # Переводим в БУ при движении на +$0.30
-BREAKEVEN_OFFSET_USD = 0.08             # +$0.08 перекрывает Taker-комиссии ($0.20)
+BREAKEVEN_OFFSET_USD = 0.08             # +$0.08 перекрывает Taker-комиссии
 
 # 6. Кулдаун отработанного уровня (в секундах)
-LEVEL_COOLDOWN_SEC = 10                # 15 минут заморозки уровня после входа
+LEVEL_COOLDOWN_SEC = 10                 # 10 секунд заморозки уровня после входа
 
 # 7. Комиссии Binance Futures (Taker 0.05%, Maker 0.02%)
 MAKER_FEE = 0.0002
@@ -120,7 +123,6 @@ def aggregate_orderbook(bids, asks, step=1.0):
     for p_str, q_str in bids:
         price = float(p_str)
         qty = float(q_str)
-        # Безопасное округление до 4 знаков для избежания багов float
         level = round(math.floor(price / step) * step, 4)
         grouped_bids[level] = grouped_bids.get(level, 0.0) + (price * qty)
 
@@ -133,11 +135,6 @@ def aggregate_orderbook(bids, asks, step=1.0):
     return grouped_bids, grouped_asks
 
 def is_book_thin_behind(grouped_book, wall_lvl, direction, step, num_levels, max_vol):
-    """
-    Проверяет, тонкий ли стакан ЗА пробиваемой стеной.
-    Возвращает (True, None, 0), если стакан чист.
-    Возвращает (False, blocked_lvl, vol), если встречен плотный уровень.
-    """
     for i in range(1, num_levels + 1):
         if direction == 'LONG':
             check_lvl = round(wall_lvl + (i * step), 4)
@@ -163,12 +160,10 @@ async def start_orderbook_ws():
     state = load_state()
 
     send_telegram(
-        f"⚡ <b>Wall Breakout Bot v2.5 (Fixed HTML) Запущен!</b>\n"
+        f"⚡ <b>Wall Breakout Bot v2.6 (Reverse Mode: {TRADE_DIRECTION}) Запущен!</b>\n"
         f"Пара: {SYMBOL} | Шаг агрегации: <b>${ORDERBOOK_AGG_STEP}</b>\n"
-        f"Детект стены: <b>≥ ${INITIAL_WALL_THRESHOLD_USD:,.0f}</b>\n"
-        f"Триггер проедания: <b>менее ${EATEN_WALL_THRESHOLD_USD:,.0f}</b>\n"
-        f"Фильтр глубины: <b>{THIN_BOOK_CHECK_LEVELS} уровней до ${MAX_BEHIND_WALL_VOL_USD:,.0f}</b>\n"
-        f"Тейк: <b>+$0.50</b> | Стоп: <b>-$0.25</b> | БУ: <b>+$0.30 (+0.08)</b>\n"
+        f"Режим входа (TRADE_DIRECTION): <b>{TRADE_DIRECTION}</b>\n"
+        f"Тейк: <b>+${TAKE_PROFIT_USD}</b> | Стоп: <b>-${STOP_LOSS_OFFSET}</b>\n"
         f"Баланс: ${state['balance']:.2f}"
     )
 
@@ -197,10 +192,8 @@ async def start_orderbook_ws():
                     best_ask = float(asks[0][0])
                     current_price = (best_bid + best_ask) / 2.0
 
-                    # Агрегация с безопасным округлением
                     g_bids, g_asks = aggregate_orderbook(bids, asks, step=ORDERBOOK_AGG_STEP)
 
-                    # Обновление реестра крупных стен
                     for lvl, vol in g_asks.items():
                         if vol >= INITIAL_WALL_THRESHOLD_USD:
                             tracked_ask_walls[lvl] = max(tracked_ask_walls.get(lvl, 0), vol)
@@ -225,8 +218,7 @@ async def start_orderbook_ws():
                                 save_state(state)
                                 send_telegram(
                                     f"🛡️ <b>LONG ПЕРЕВЕДЕН В БЕЗУБЫТОК!</b>\n"
-                                    f"Текущая цена: ${current_price:.2f}\n"
-                                    f"Новый стоп-лосс: <b>${new_sl:.2f}</b> (Вход: ${entry:.2f})"
+                                    f"Цена: ${current_price:.2f} | Новый стоп: <b>${new_sl:.2f}</b>"
                                 )
 
                             elif current_price >= tp:
@@ -262,16 +254,14 @@ async def start_orderbook_ws():
                                 else:
                                     state['losses'] += 1
                                     state['cooldown_until'] = time.time() + 300
-                                    msg_title = "🛑 <b>LONG ЗАКРЫТ ПО СТОП-ЛОССУ (Ложный пробой)</b>"
+                                    msg_title = "🛑 <b>LONG ЗАКРЫТ ПО СТОП-ЛОССУ</b>"
 
                                 state['position'] = None
                                 save_state(state)
 
                                 send_telegram(
-                                    f"{msg_title}\n"
-                                    f"Вход: ${entry:.2f} ➔ Выход: ${exit_p:.2f}\n"
-                                    f"Итог: <b>{format_pnl_str(net_pnl)}</b>\n"
-                                    f"Баланс: <b>${state['balance']:.2f}</b>"
+                                    f"{msg_title}\nВход: ${entry:.2f} ➔ Выход: ${exit_p:.2f}\n"
+                                    f"Итог: <b>{format_pnl_str(net_pnl)}</b> | Баланс: <b>${state['balance']:.2f}</b>"
                                 )
 
                         elif pos_type == 'SHORT':
@@ -282,8 +272,7 @@ async def start_orderbook_ws():
                                 save_state(state)
                                 send_telegram(
                                     f"🛡️ <b>SHORT ПЕРЕВЕДЕН В БЕЗУБЫТОК!</b>\n"
-                                    f"Текущая цена: ${current_price:.2f}\n"
-                                    f"Новый стоп-лосс: <b>${new_sl:.2f}</b> (Вход: ${entry:.2f})"
+                                    f"Цена: ${current_price:.2f} | Новый стоп: <b>${new_sl:.2f}</b>"
                                 )
 
                             elif current_price <= tp:
@@ -319,16 +308,14 @@ async def start_orderbook_ws():
                                 else:
                                     state['losses'] += 1
                                     state['cooldown_until'] = time.time() + 300
-                                    msg_title = "🛑 <b>SHORT ЗАКРЫТ ПО СТОП-ЛОССУ (Ложный пробой)</b>"
+                                    msg_title = "🛑 <b>SHORT ЗАКРЫТ ПО СТОП-ЛОССУ</b>"
 
                                 state['position'] = None
                                 save_state(state)
 
                                 send_telegram(
-                                    f"{msg_title}\n"
-                                    f"Вход: ${entry:.2f} ➔ Выход: ${exit_p:.2f}\n"
-                                    f"Итог: <b>{format_pnl_str(net_pnl)}</b>\n"
-                                    f"Баланс: <b>${state['balance']:.2f}</b>"
+                                    f"{msg_title}\nВход: ${entry:.2f} ➔ Выход: ${exit_p:.2f}\n"
+                                    f"Итог: <b>{format_pnl_str(net_pnl)}</b> | Баланс: <b>${state['balance']:.2f}</b>"
                                 )
 
                     # 2. ПОИСК ТОЧЕК ВХОДА С ПРОВЕРКОЙ СТАКАНА
@@ -336,7 +323,7 @@ async def start_orderbook_ws():
                         if time.time() < state.get('cooldown_until', 0):
                             continue
 
-                        # А) LONG
+                        # А) СИГНАЛ ПО ASK-СТЕНЕ
                         for wall_lvl, peak_vol in list(tracked_ask_walls.items()):
                             if time.time() < level_cooldowns.get(wall_lvl, 0):
                                 continue
@@ -345,22 +332,28 @@ async def start_orderbook_ws():
                                 current_vol = g_asks.get(wall_lvl, 0.0)
 
                                 if current_vol < EATEN_WALL_THRESHOLD_USD:
-                                    # ПРОВЕРКА: Тонкий ли стакан ЗА стеной?
                                     is_thin, block_lvl, block_vol = is_book_thin_behind(
                                         g_asks, wall_lvl, 'LONG', ORDERBOOK_AGG_STEP,
                                         THIN_BOOK_CHECK_LEVELS, MAX_BEHIND_WALL_VOL_USD
                                     )
 
                                     if not is_thin:
-                                        print(f"⚠️ Пропуск LONG у ${wall_lvl}: уровень ${block_lvl} перекрыт объемом ${block_vol/1e3:.0f}k")
+                                        print(f"⚠️ Пропуск сигнала у ${wall_lvl}: уровень ${block_lvl} перекрыт объемом ${block_vol/1e3:.0f}k")
                                         continue
 
+                                    # Учет Trade Direction (1 = LONG, -1 = SHORT)
+                                    pos_type = 'LONG' if TRADE_DIRECTION == 1 else 'SHORT'
                                     entry_p = current_price
-                                    sl_p = entry_p - STOP_LOSS_OFFSET
-                                    tp_p = entry_p + TAKE_PROFIT_USD
+
+                                    if pos_type == 'LONG':
+                                        sl_p = entry_p - STOP_LOSS_OFFSET
+                                        tp_p = entry_p + TAKE_PROFIT_USD
+                                    else:
+                                        sl_p = entry_p + STOP_LOSS_OFFSET
+                                        tp_p = entry_p - TAKE_PROFIT_USD
 
                                     state['position'] = {
-                                        'type': 'LONG',
+                                        'type': pos_type,
                                         'entry': entry_p,
                                         'sl': sl_p,
                                         'tp': tp_p,
@@ -371,10 +364,10 @@ async def start_orderbook_ws():
                                     save_state(state)
                                     del tracked_ask_walls[wall_lvl]
 
+                                    icon = "🚀" if pos_type == 'LONG' else "📉"
                                     send_telegram(
-                                        f"🚀 <b>ПРОЕДАНИЕ СТЕНЫ! ВХОД В LONG</b>\n"
-                                        f"🔥 Пробита стена: <b>${wall_lvl:.2f}</b> (Пик: ${peak_vol/1e6:.2f}M ➔ Ост: ${current_vol/1e3:.0f}k)\n"
-                                        f"📊 Стакан за стеной: <b>Чист (до ${MAX_BEHIND_WALL_VOL_USD/1e3:.0f}k)</b>\n"
+                                        f"{icon} <b>ПРОЕДАНИЕ ASK-СТЕНЫ (РЕВЕРС: {TRADE_DIRECTION}) ➔ ВХОД В {pos_type}</b>\n"
+                                        f"🔥 Стена: <b>${wall_lvl:.2f}</b> (Пик: ${peak_vol/1e6:.2f}M ➔ Ост: ${current_vol/1e3:.0f}k)\n"
                                         f"Вход по маркету: <b>${entry_p:.2f}</b>\n"
                                         f"Тейк-профит: ${tp_p:.2f} | Стоп-лосс: ${sl_p:.2f}"
                                     )
@@ -383,7 +376,7 @@ async def start_orderbook_ws():
                         if state['position'] is not None:
                             continue
 
-                        # Б) SHORT
+                        # Б) СИГНАЛ ПО BID-СТЕНЕ
                         for wall_lvl, peak_vol in list(tracked_bid_walls.items()):
                             if time.time() < level_cooldowns.get(wall_lvl, 0):
                                 continue
@@ -392,22 +385,28 @@ async def start_orderbook_ws():
                                 current_vol = g_bids.get(wall_lvl, 0.0)
 
                                 if current_vol < EATEN_WALL_THRESHOLD_USD:
-                                    # ПРОВЕРКА: Тонкий ли стакан ЗА стеной?
                                     is_thin, block_lvl, block_vol = is_book_thin_behind(
                                         g_bids, wall_lvl, 'SHORT', ORDERBOOK_AGG_STEP,
                                         THIN_BOOK_CHECK_LEVELS, MAX_BEHIND_WALL_VOL_USD
                                     )
 
                                     if not is_thin:
-                                        print(f"⚠️ Пропуск SHORT у ${wall_lvl}: уровень ${block_lvl} перекрыт объемом ${block_vol/1e3:.0f}k")
+                                        print(f"⚠️ Пропуск сигнала у ${wall_lvl}: уровень ${block_lvl} перекрыт объемом ${block_vol/1e3:.0f}k")
                                         continue
 
+                                    # Учет Trade Direction (-1 инвертирует BID-стену в LONG)
+                                    pos_type = 'SHORT' if TRADE_DIRECTION == 1 else 'LONG'
                                     entry_p = current_price
-                                    sl_p = entry_p + STOP_LOSS_OFFSET
-                                    tp_p = entry_p - TAKE_PROFIT_USD
+
+                                    if pos_type == 'LONG':
+                                        sl_p = entry_p - STOP_LOSS_OFFSET
+                                        tp_p = entry_p + TAKE_PROFIT_USD
+                                    else:
+                                        sl_p = entry_p + STOP_LOSS_OFFSET
+                                        tp_p = entry_p - TAKE_PROFIT_USD
 
                                     state['position'] = {
-                                        'type': 'SHORT',
+                                        'type': pos_type,
                                         'entry': entry_p,
                                         'sl': sl_p,
                                         'tp': tp_p,
@@ -418,10 +417,10 @@ async def start_orderbook_ws():
                                     save_state(state)
                                     del tracked_bid_walls[wall_lvl]
 
+                                    icon = "📉" if pos_type == 'SHORT' else "🚀"
                                     send_telegram(
-                                        f"📉 <b>ПРОЕДАНИЕ СТЕНЫ! ВХОД В SHORT</b>\n"
-                                        f"🔥 Пробита стена: <b>${wall_lvl:.2f}</b> (Пик: ${peak_vol/1e6:.2f}M ➔ Ост: ${current_vol/1e3:.0f}k)\n"
-                                        f"📊 Стакан за стеной: <b>Чист (до ${MAX_BEHIND_WALL_VOL_USD/1e3:.0f}k)</b>\n"
+                                        f"{icon} <b>ПРОЕДАНИЕ BID-СТЕНЫ (РЕВЕРС: {TRADE_DIRECTION}) ➔ ВХОД В {pos_type}</b>\n"
+                                        f"🔥 Стена: <b>${wall_lvl:.2f}</b> (Пик: ${peak_vol/1e6:.2f}M ➔ Ост: ${current_vol/1e3:.0f}k)\n"
                                         f"Вход по маркету: <b>${entry_p:.2f}</b>\n"
                                         f"Тейк-профит: ${tp_p:.2f} | Стоп-лосс: ${sl_p:.2f}"
                                     )
