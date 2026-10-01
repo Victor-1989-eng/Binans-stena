@@ -32,11 +32,11 @@ MAX_WALL_THRESHOLD_USD = 2_000_000      # Верхний предел (отсе�
 EATEN_WALL_THRESHOLD_USD = 100_000      # Порог считающейся «съеденной» стены
 
 # 2. Фильтр Спуфинга (Анти-манипуляция)
-MIN_SPOOF_EXECUTION_RATIO = 0.20        # 40% от объема стены должно быть выкуплено по факту
+MIN_SPOOF_EXECUTION_RATIO = 0.10        # 40% от объема стены должно быть выкуплено по факту
 
 # 3. Фильтр "Тонкого стакана за стеной"
 THIN_BOOK_CHECK_LEVELS = 3              
-MAX_BEHIND_WALL_VOL_USD = 600_000       
+MAX_BEHIND_WALL_VOL_USD = 100_000       
 
 # 4. Риск-менеджмент
 TAKE_PROFIT_USD = 0.60                  
