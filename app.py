@@ -24,8 +24,8 @@ MARGIN_PER_TRADE = 10.0
 POSITION_SIZE_USD = MARGIN_PER_TRADE * LEVERAGE  # $200 в рынке
 
 # 1. Сбор статистики и диапазоны стен
-COLLECTION_PERIOD_HOURS = 24            
-MIN_EVENTS_TO_START_TRADING = 10       
+COLLECTION_PERIOD_HOURS = 0            
+MIN_EVENTS_TO_START_TRADING = 0       
 ORDERBOOK_AGG_STEP = 0.1                
 INITIAL_WALL_THRESHOLD_USD = 500_000    # Минимальный начальный порог ($500k)
 MAX_WALL_THRESHOLD_USD = 2_000_000      # Верхний предел (отсекает тяжелые $2.5M+ стены)
