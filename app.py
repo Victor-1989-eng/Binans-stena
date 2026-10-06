@@ -24,15 +24,15 @@ MARGIN_PER_TRADE = 10.0
 POSITION_SIZE_USD = MARGIN_PER_TRADE * LEVERAGE  # $200 в рынке
 
 # 1. Сбор статистики и диапазоны стен
-COLLECTION_PERIOD_HOURS = 0             
-MIN_EVENTS_TO_START_TRADING = 0       
+COLLECTION_PERIOD_HOURS = 24             
+MIN_EVENTS_TO_START_TRADING = 200       
 ORDERBOOK_AGG_STEP = 0.1                
-INITIAL_WALL_THRESHOLD_USD = 400_000    # Минимальный начальный порог ($400k)
+INITIAL_WALL_THRESHOLD_USD = 1_000_000    # Минимальный начальный порог ($400k)
 MAX_WALL_THRESHOLD_USD = 2_000_000      # Верхний предел ($2M)
-EATEN_WALL_THRESHOLD_USD = 100_000      # Порог считающейся «съеденной» стены
+EATEN_WALL_THRESHOLD_USD = 600_000      # Порог считающейся «съеденной» стены
 
 # 2. Фильтр Спуфинга (Анти-манипуляция)
-MIN_SPOOF_EXECUTION_RATIO = 0.10        # Мин. 10% от объема стены должно быть выкуплено
+MIN_SPOOF_EXECUTION_RATIO = 0.20        # Мин. 10% от объема стены должно быть выкуплено
 
 # 3. Фильтр "Тонкого стакана за стеной"
 THIN_BOOK_CHECK_LEVELS = 3              
