@@ -189,19 +189,20 @@ def get_adaptive_settings():
     is_time_passed = elapsed_hours >= COLLECTION_PERIOD_HOURS
     is_enough_data = len(history) >= MIN_EVENTS_TO_START_TRADING
 
+    # ✅ ИСПРАВЛЕНО: Возвращаем False (торговля НЕ активна), пока идет сбор данных
     if not (is_time_passed and is_enough_data):
-        return INITIAL_WALL_THRESHOLD_USD, MAX_WALL_THRESHOLD_USD, True, elapsed_hours
+        return INITIAL_WALL_THRESHOLD_USD, MAX_WALL_THRESHOLD_USD, False, elapsed_hours
 
     successful_walls = [e["peak_volume_usd"] for e in history if e.get("is_successful_breakout")]
     
     if len(successful_walls) < 5:
         all_walls = [e["peak_volume_usd"] for e in history]
         avg_vol = (sum(all_walls) / len(all_walls)) if all_walls else INITIAL_WALL_THRESHOLD_USD
-        min_thresh = max(300_000, avg_vol * 0.85)
+        min_thresh = max(250_000, avg_vol * 0.85)
         max_thresh = MAX_WALL_THRESHOLD_USD
     else:
         avg_success_vol = sum(successful_walls) / len(successful_walls)
-        min_thresh = max(300_000, avg_success_vol * 0.8)
+        min_thresh = max(250_000, avg_success_vol * 0.8)
         max_thresh = min(MAX_WALL_THRESHOLD_USD, avg_success_vol * 1.4)
 
     return round(min_thresh, 2), round(max_thresh, 2), True, elapsed_hours
