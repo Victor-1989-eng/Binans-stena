@@ -37,7 +37,7 @@ BREAKEVEN_TRIGGER_USD = 0.30            # Переводим в БУ при дв
 BREAKEVEN_OFFSET_USD = 0.08             # +$0.08 перекрывает Taker-комиссии ($0.20)
 
 # 6. Кулдаун отработанного уровня (в секундах)
-LEVEL_COOLDOWN_SEC = 10                # 15 минут заморозки уровня после входа
+LEVEL_COOLDOWN_SEC = 30                # 15 минут заморозки уровня после входа
 
 # 7. Комиссии Binance Futures (Taker 0.05%, Maker 0.02%)
 MAKER_FEE = 0.0002
