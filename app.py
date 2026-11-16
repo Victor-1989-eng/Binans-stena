@@ -18,11 +18,11 @@ MARGIN_PER_TRADE = 10.0
 POSITION_SIZE_USD = MARGIN_PER_TRADE * LEVERAGE  # $200 в рынке
 
 # 1. Настройки агрегации стакана
-ORDERBOOK_AGG_STEP = 0.1                # Шаг группировки уровней (0.1, 0.5, 1.0, 2.0)
+ORDERBOOK_AGG_STEP = 0.01                # Шаг группировки уровней (0.1, 0.5, 1.0, 2.0)
 
 # 2. Пороги определения и проедания стен
 INITIAL_WALL_THRESHOLD_USD = 100_000  # Детект стены от $1.5M
-EATEN_WALL_THRESHOLD_USD = 50_000      # Сигнал на вход, когда осталось менее $200k
+EATEN_WALL_THRESHOLD_USD = 10_000      # Сигнал на вход, когда осталось менее $200k
 
 # 3. Фильтр "Тонкого стакана за стеной"
 THIN_BOOK_CHECK_LEVELS = 3              # Сколько уровней ЗА стеной проверяем
