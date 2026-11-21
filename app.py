@@ -29,8 +29,8 @@ THIN_BOOK_CHECK_LEVELS = 10              # Сколько уровней ЗА с
 MAX_BEHIND_WALL_VOL_USD = 20_000       # Макс. объем на любом из уровней за стеной
 
 # 4. Риск-менеджмент
-TAKE_PROFIT_USD = 0.45                  # Тейк-профит (+$0.50 от входа)
-STOP_LOSS_OFFSET = 0.15                 # Фиксированный стоп-лосс ($0.25)
+TAKE_PROFIT_USD = 0.35                  # Тейк-профит (+$0.50 от входа)
+STOP_LOSS_OFFSET = 0.35                 # Фиксированный стоп-лосс ($0.25)
 
 # 5. Настройки безубытка (Break-Even)
 BREAKEVEN_TRIGGER_USD = 0.20            # Переводим в БУ при движении на +$0.30
@@ -40,7 +40,7 @@ BREAKEVEN_OFFSET_USD = 0.08             # +$0.08 перекрывает Taker-к
 LEVEL_COOLDOWN_SEC = 480                # 15 минут заморозки уровня после входа
 
 # 7. Комиссии Binance Futures (Taker 0.05%, Maker 0.02%)
-MAKER_FEE = 0.0002
+MAKER_FEE = 0.0003
 TAKER_FEE = 0.0003
 
 # 8. Телеграм и хранилище
